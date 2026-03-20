@@ -79,6 +79,8 @@ function effectiveMaxConcurrency() {
 
 function aiSoftMaxConcurrencyFromKey(key) {
   const k = String(key || "").trim();
+  const kl = k.toLowerCase();
+  if (kl === "local" || kl === "ollama" || kl === "llama" || kl === "llama-server" || kl === "lmstudio" || kl === "localhost" || kl === "none" || kl === "dummy" || kl === "no-key" || kl.startsWith("local-") || kl.startsWith("local_")) return 5;
   if (k.startsWith("hf_")) return 3;
   return 10;
 }
@@ -1770,6 +1772,7 @@ async function getSettings() {
         "maxConcurrency",
         "aiKey",
         "aiModel",
+        "aiBaseUrl",
         "aiPromptByLang",
         "aiPrompt",
       ],
@@ -1818,6 +1821,7 @@ async function getSettings() {
           sources: typeof it.sources === "string" ? it.sources : "translated",
           aiKey: typeof it.aiKey === "string" ? it.aiKey : "",
           aiModel,
+          aiBaseUrl: typeof it.aiBaseUrl === "string" ? it.aiBaseUrl : "",
           aiPrompt,
         });
       },
@@ -1832,7 +1836,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
     const tabSessionId = tab?.id
       ? ensureTabSession(tab.id, tab?.url || "")
       : "";
-    const { mode, lang, sources, aiKey, aiModel, aiPrompt } =
+    const { mode, lang, sources, aiKey, aiModel, aiBaseUrl, aiPrompt } =
       await getSettings();
     const source =
       mode === "lens_text" ? sources || "translated" : "translated";
@@ -1841,6 +1845,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
         ? {
             api_key: aiKey || "",
             model: aiModel || "auto",
+            base_url: aiBaseUrl || "auto",
             prompt: aiPrompt || "",
           }
         : null;

@@ -1014,6 +1014,23 @@ async def ai_resolve(payload: Dict[str, Any]):
         models = getattr(core, '_anthropic_available_models',
                          lambda _k, _b=None: [])(api_key, base_url)
 
+    elif provider == 'local':
+        if not base_url:
+            base_url = (core.AI_PROVIDER_DEFAULTS.get('local') or {}).get(
+                'base_url') or 'http://127.0.0.1:8080/v1'
+        try:
+            models_url = base_url.rstrip('/') + '/models'
+            with httpx.Client(timeout=8.0) as client:
+                r = client.get(models_url)
+                if r.status_code == 200:
+                    data = r.json()
+                    for m in (data.get('data') or []):
+                        mid = (m.get('id') if isinstance(m, dict) else None)
+                        if isinstance(mid, str) and mid.strip():
+                            models.append(mid.strip())
+        except Exception:
+            pass
+
     else:
         if not base_url:
             base_url = (core.AI_PROVIDER_DEFAULTS.get('openai') or {}).get(

@@ -30,10 +30,23 @@
         <input
           type="password"
           id="ai-key"
-          placeholder="Paste your AI_API_KEY (Gemini/OpenRouter/HF/Groq/etc.)"
+          placeholder="Paste your AI_API_KEY or type 'local' for local AI"
         />
         <div class="hint">
-          If empty, the extension will use translated overlay (no AI).
+          If empty, the extension will use translated overlay (no AI).<br />
+          For local AI (llama-server / Ollama / LM Studio), type <strong>local</strong> as the key.
+        </div>
+      </div>
+
+      <div class="field" id="ai-baseurl-wrap" style="display: none">
+        <label for="ai-baseurl">AI Base URL</label>
+        <input
+          type="text"
+          id="ai-baseurl"
+          placeholder="http://127.0.0.1:8080/v1"
+        />
+        <div class="hint">
+          Endpoint for your AI server. Default: <code>http://127.0.0.1:8080/v1</code> (llama-server)
         </div>
       </div>
 

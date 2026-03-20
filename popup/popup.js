@@ -146,6 +146,8 @@ const langWrap = document.getElementById("lang-wrap");
 const sourcesWrap = document.getElementById("sources-wrap");
 const aiKeyWrap = document.getElementById("ai-key-wrap");
 const aiKeyInput = document.getElementById("ai-key");
+const aiBaseUrlWrap = document.getElementById("ai-baseurl-wrap");
+const aiBaseUrlInput = document.getElementById("ai-baseurl");
 const aiModelWrap = document.getElementById("ai-model-wrap");
 const aiModelSel = document.getElementById("ai-model");
 const aiPromptWrap = document.getElementById("ai-prompt-wrap");
@@ -183,6 +185,7 @@ let lastResolvedKey = "";
 let desiredLang = "en";
 let desiredSources = "translated";
 let desiredAiModel = "auto";
+let desiredAiBaseUrl = "";
 
 let aiPromptByLangState = {};
 let aiPromptDefaultsByLang = {};
@@ -426,6 +429,11 @@ function populateModes() {
   });
 }
 
+function isLocalAiKey(key) {
+  const k = (key || "").trim().toLowerCase();
+  return ["local", "ollama", "lmstudio", "llama", "llama-server", "localhost", "none", "dummy", "no-key"].includes(k) || k.startsWith("local-") || k.startsWith("local_");
+}
+
 function toggleUi() {
   const modeId = modeSel.value || "lens_text";
   const isText = modeId === "lens_text";
@@ -440,8 +448,10 @@ function toggleUi() {
   const hasEnv = Boolean(metaCache?.has_env_ai_key);
   const hasKey = (aiKeyInput.value || "").trim().length > 0;
   const canConfigureAi = hasKey || hasEnv;
+  const showBaseUrl = showAi && canConfigureAi && isLocalAiKey(aiKeyInput.value);
 
   aiKeyWrap.style.display = showAi ? "" : "none";
+  if (aiBaseUrlWrap) aiBaseUrlWrap.style.display = showBaseUrl ? "" : "none";
   aiModelWrap.style.display = showAi && canConfigureAi ? "" : "none";
   aiPromptWrap.style.display = showAi && canConfigureAi ? "" : "none";
 }
@@ -555,9 +565,10 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
     const currentModel =
       (aiModelSel.value || "").trim() || desiredAiModel || "auto";
 
+    const aiBaseUrl = (aiBaseUrlInput?.value || "").trim() || "";
     const data = await fetchJson(
       `${base}${AI_RESOLVE_PATH}`,
-      { api_key: aiKey, model: currentModel, lang },
+      { api_key: aiKey, model: currentModel, lang, base_url: aiBaseUrl || "auto" },
       AI_META_TIMEOUT_MS,
     );
     if (seq !== aiMetaSeq) return;
@@ -727,11 +738,13 @@ function scheduleSaveAi() {
   aiDebounce = setTimeout(async () => {
     pendingAiSave = false;
     const modeId = modeSel.value || "lens_text";
+    const aiBaseUrl = (aiBaseUrlInput?.value || "").trim();
+    desiredAiBaseUrl = aiBaseUrl;
     if (modeId !== "lens_text") {
       const aiKey = (aiKeyInput.value || "").trim();
       const aiModel = normalizeAiModel((aiModelSel.value || "").trim() || desiredAiModel || "auto");
       desiredAiModel = aiModel;
-      await chrome.storage.local.set({ aiKey, aiModel });
+      await chrome.storage.local.set({ aiKey, aiModel, aiBaseUrl });
       chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
       return;
     }
@@ -752,6 +765,7 @@ function scheduleSaveAi() {
     await chrome.storage.local.set({
       aiKey,
       aiModel,
+      aiBaseUrl,
       aiPromptByLang: aiPromptByLangState,
     });
     chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
@@ -820,6 +834,7 @@ async function loadSettings() {
     "customApiUrl",
     "aiKey",
     "aiModel",
+    "aiBaseUrl",
     "aiPromptByLang",
   ]);
 
@@ -856,6 +871,7 @@ async function loadSettings() {
   if (storedCustom) userInteractedApi = true;
 
   const aiKey = String(stored.aiKey || "");
+  desiredAiBaseUrl = String(stored.aiBaseUrl || "");
   aiPromptByLangState =
     stored.aiPromptByLang && typeof stored.aiPromptByLang === "object"
       ? stored.aiPromptByLang
@@ -870,6 +886,7 @@ async function loadSettings() {
     : "";
 
   aiKeyInput.value = aiKey;
+  if (aiBaseUrlInput) aiBaseUrlInput.value = desiredAiBaseUrl;
   setModelOptions([], { keepValue: desiredAiModel });
   aiPromptInput.value = prompt;
   updatePromptCount(prompt);
@@ -929,6 +946,7 @@ window.addEventListener("pagehide", () => {
     const modeId = modeSel.value || "lens_text";
     const aiKey = (aiKeyInput.value || "").trim();
     const aiModel = normalizeAiModel((aiModelSel.value || "").trim() || desiredAiModel || "auto");
+    const aiBaseUrl = (aiBaseUrlInput?.value || "").trim();
     desiredAiModel = aiModel;
 
     if (modeId === "lens_text") {
@@ -944,10 +962,11 @@ window.addEventListener("pagehide", () => {
         chrome.storage.local.set({
           aiKey,
           aiModel,
+          aiBaseUrl,
           aiPromptByLang: aiPromptByLangState,
         });
     } else if (pendingAiSave) {
-      chrome.storage.local.set({ aiKey, aiModel });
+      chrome.storage.local.set({ aiKey, aiModel, aiBaseUrl });
     }
   } catch {}
 });
@@ -1003,13 +1022,26 @@ apiInput.addEventListener("blur", (e) => scheduleSaveApi(e.target.value));
 
 aiKeyInput.addEventListener("input", () => {
   modelDirty = false;
+  toggleUi();
   scheduleSaveAi();
   scheduleResolveAiMeta();
 });
 aiKeyInput.addEventListener("blur", () => {
+  toggleUi();
   scheduleSaveAi();
   scheduleResolveAiMeta({ immediate: true });
 });
+
+if (aiBaseUrlInput) {
+  aiBaseUrlInput.addEventListener("input", () => {
+    scheduleSaveAi();
+    scheduleResolveAiMeta();
+  });
+  aiBaseUrlInput.addEventListener("blur", () => {
+    scheduleSaveAi();
+    scheduleResolveAiMeta({ immediate: true });
+  });
+}
 
 aiModelSel.addEventListener("change", async () => {
   const prevModel = desiredAiModel;

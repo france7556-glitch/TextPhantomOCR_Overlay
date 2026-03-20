@@ -376,6 +376,10 @@ AI_PROVIDER_DEFAULTS = {
         "model": "claude-sonnet-4-20250514",
         "base_url": "https://api.anthropic.com",
     },
+    "local": {
+        "model": "auto",
+        "base_url": "http://127.0.0.1:8080/v1",
+    },
 }
 
 AI_PROVIDER_ALIASES = {
@@ -387,6 +391,13 @@ AI_PROVIDER_ALIASES = {
     "gemini3": "gemini",
     "gemini-3": "gemini",
     "google": "gemini",
+    "ollama": "local",
+    "lmstudio": "local",
+    "lm_studio": "local",
+    "llama": "local",
+    "llama-server": "local",
+    "llama_server": "local",
+    "localhost": "local",
 }
 
 AI_MODEL_ALIASES = {
@@ -670,6 +681,11 @@ def _read_first_env(*names: str) -> str:
 
 def _detect_ai_provider_from_key(api_key: str) -> str:
     k = (api_key or "").strip()
+    kl = k.lower()
+    if kl in ("local", "ollama", "lmstudio", "llama", "llama-server", "localhost", "none", "dummy", "no-key"):
+        return "local"
+    if kl.startswith("local-") or kl.startswith("local_"):
+        return "local"
     if k.startswith("AIza"):
         return "gemini"
     if k.startswith("hf_"):
