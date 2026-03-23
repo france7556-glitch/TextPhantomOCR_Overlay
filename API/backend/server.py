@@ -463,7 +463,7 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         },
     }
 
-def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
+def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
     mode_id = (mode or '').strip()
     if mode_id not in SUPPORTED_MODES:
         mode_id = 'lens_images'
@@ -774,6 +774,214 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
     out['imageDataUri'] = _bytes_to_datauri(buf.getvalue(), 'image/png')
 
     return out
+
+def _shift_tree_y(tree: dict, offset_y_px: int, total_h_px: int, tile_h_px: int):
+    if not isinstance(tree, dict) or 'paragraphs' not in tree:
+        return
+    for p in (tree.get('paragraphs') or []):
+        if not isinstance(p, dict): continue
+        if 'bounds_px' in p and isinstance(p['bounds_px'], (list, tuple)) and len(p['bounds_px']) == 4:
+            bpx = list(p['bounds_px'])
+            bpx[1] += offset_y_px
+            bpx[3] += offset_y_px
+            p['bounds_px'] = tuple(bpx)
+            
+        for it in (p.get('items') or []):
+            if not isinstance(it, dict): continue
+            
+            # Shift baseline points
+            for bp_key in ('baseline_p1', 'baseline_p2'):
+                if bp_key in it and isinstance(it[bp_key], dict) and 'y' in it[bp_key]:
+                    old_y_px = it[bp_key]['y'] * tile_h_px
+                    new_y_px = old_y_px + offset_y_px
+                    it[bp_key]['y'] = new_y_px / total_h_px
+
+            if 'bounds_px' in it and isinstance(it['bounds_px'], (list, tuple)) and len(it['bounds_px']) == 4:
+                bpx = list(it['bounds_px'])
+                bpx[1] += offset_y_px
+                bpx[3] += offset_y_px
+                it['bounds_px'] = tuple(bpx)
+
+            b = it.get('box')
+            if isinstance(b, dict):
+                if 'top' in b:
+                    old_top_px = b['top'] * tile_h_px
+                    b['top'] = (old_top_px + offset_y_px) / total_h_px
+                    b['top_pct'] = b['top'] * 100.0
+                if 'height' in b:
+                    old_h_px = b['height'] * tile_h_px
+                    b['height'] = old_h_px / total_h_px
+                    b['height_pct'] = b['height'] * 100.0
+                if 'center' in b and isinstance(b['center'], dict) and 'y' in b['center']:
+                    old_cy_px = b['center']['y'] * tile_h_px
+                    b['center']['y'] = (old_cy_px + offset_y_px) / total_h_px
+                    
+            for sp in (it.get('spans') or []):
+                if not isinstance(sp, dict): continue
+                for bp_key in ('baseline_p1', 'baseline_p2'):
+                    if bp_key in sp and isinstance(sp[bp_key], dict) and 'y' in sp[bp_key]:
+                        old_y_px = sp[bp_key]['y'] * tile_h_px
+                        new_y_px = old_y_px + offset_y_px
+                        sp[bp_key]['y'] = new_y_px / total_h_px
+                sb = sp.get('box')
+                if isinstance(sb, dict):
+                    if 'top' in sb:
+                        old_top_px = sb['top'] * tile_h_px
+                        sb['top'] = (old_top_px + offset_y_px) / total_h_px
+                        sb['top_pct'] = sb['top'] * 100.0
+                    if 'height' in sb:
+                        old_h_px = sb['height'] * tile_h_px
+                        sb['height'] = old_h_px / total_h_px
+                        sb['height_pct'] = sb['height'] * 100.0
+                    if 'center' in sb and isinstance(sb['center'], dict) and 'y' in sb['center']:
+                        old_cy_px = sb['center']['y'] * tile_h_px
+                        sb['center']['y'] = (old_cy_px + offset_y_px) / total_h_px
+
+def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
+    img = core.Image.open(image_path)
+    W, H = img.size
+    MAX_H = 3000
+    
+    if H <= MAX_H:
+        return _process_image_path_single(image_path, lang, mode, ai_cfg)
+        
+    # Split image into vertical tiles
+    tiles = []
+    y = 0
+    while y < H:
+        tile_h = min(MAX_H, H - y)
+        box = (0, y, W, y + tile_h)
+        tile_img = img.crop(box)
+        tiles.append((y, tile_h, tile_img))
+        y += tile_h
+
+    results = []
+    for offset_y, tile_h, tile_img in tiles:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+            tile_img.convert("RGB").save(f, format="JPEG", quality=95)
+            tmp_tile_path = f.name
+        try:
+            res = _process_image_path_single(tmp_tile_path, lang, mode, ai_cfg)
+            results.append((offset_y, tile_h, res))
+        finally:
+            try:
+                os.unlink(tmp_tile_path)
+            except:
+                pass
+
+    if not results:
+        raise Exception("Failed to process any image tiles")
+
+    # Merge results
+    merged = results[0][2].copy()
+    
+    merged_original_text = []
+    merged_translated_text = []
+    merged_ai_text = []
+    
+    merged_original_tree = {"side": "original", "paragraphs": []}
+    merged_translated_tree = {"side": "translated", "paragraphs": []}
+    merged_ai_tree = {"side": "Ai", "paragraphs": []}
+    
+    merged_images = []
+    
+    para_idx_offset = {"original": 0, "translated": 0, "Ai": 0}
+
+    for offset_y, tile_h, res in results:
+        # Merge texts
+        if res.get('originalTextFull'):
+            merged_original_text.append(res['originalTextFull'].strip())
+        if res.get('translatedTextFull'):
+            merged_translated_text.append(res['translatedTextFull'].strip())
+        if res.get('AiTextFull'):
+            merged_ai_text.append(res['AiTextFull'].strip())
+            
+        # Shift and merge trees
+        for tree_key, result_tree_key, role in [
+            ('original', 'originalTree', 'original'),
+            ('translated', 'translatedTree', 'translated'),
+            ('Ai', 'aiTree', 'Ai')
+        ]:
+            if isinstance(res.get(tree_key), dict) and result_tree_key in res[tree_key]:
+                t = res[tree_key][result_tree_key]
+                if t:
+                    _shift_tree_y(t, offset_y, H, tile_h)
+                    
+                    # Fix paragraph indices to be monotonically increasing
+                    for p in (t.get('paragraphs') or []):
+                        p['para_index'] = para_idx_offset[role]
+                        para_idx_offset[role] += 1
+                        for sp in (p.get('items') or []):
+                            sp['para_index'] = p['para_index']
+                            for s in (sp.get('spans') or []):
+                                s['para_index'] = p['para_index']
+                                
+                    if role == 'original':
+                        merged_original_tree['paragraphs'].extend(t.get('paragraphs') or [])
+                    elif role == 'translated':
+                        merged_translated_tree['paragraphs'].extend(t.get('paragraphs') or [])
+                    elif role == 'Ai':
+                        merged_ai_tree['paragraphs'].extend(t.get('paragraphs') or [])
+
+        # Read rendered overlay image for this chunk
+        uri = res.get('imageDataUri')
+        if uri:
+            img_bytes, _ = _datauri_to_bytes(uri)
+            chunk_img = core.Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            merged_images.append((offset_y, chunk_img))
+
+    merged['originalTextFull'] = "\n\n".join(merged_original_text)
+    merged['translatedTextFull'] = "\n\n".join(merged_translated_text)
+    merged['AiTextFull'] = "\n\n".join(merged_ai_text)
+    
+    if 'original' in merged and isinstance(merged['original'], dict):
+        merged['original']['originalTree'] = merged_original_tree
+        merged['original']['originalTextFull'] = merged['originalTextFull']
+    if 'translated' in merged and isinstance(merged['translated'], dict):
+        merged['translated']['translatedTree'] = merged_translated_tree
+        merged['translated']['translatedTextFull'] = merged['translatedTextFull']
+    if 'Ai' in merged and isinstance(merged['Ai'], dict):
+        merged['Ai']['aiTree'] = merged_ai_tree
+        merged['Ai']['aiTextFull'] = merged['AiTextFull']
+        merged['Ai']['meta'] = results[-1][2].get('Ai', {}).get('meta', {}) # Give meta from last tile
+
+    # Re-generate HTML
+    thai_font = getattr(core, 'FONT_THAI_PATH', 'NotoSansThai-Regular.ttf')
+    latin_font = getattr(core, 'FONT_LATIN_PATH', 'NotoSans-Regular.ttf')
+
+    # Regenerate translated HTML if present
+    if merged.get('translated') and getattr(core, 'DO_TRANSLATED_HTML', True):
+        core.fit_tree_font_sizes_for_tp_html(merged_translated_tree, thai_font, latin_font, W, H)
+        merged['translated']['translatedhtml'] = core.ai_tree_to_tp_html(merged_translated_tree, W, H)
+
+    # Regenerate original HTML if present
+    if merged.get('original') and getattr(core, 'DO_ORIGINAL_HTML', True):
+        core.fit_tree_font_sizes_for_tp_html(merged_original_tree, thai_font, latin_font, W, H)
+        merged['original']['originalhtml'] = core.ai_tree_to_tp_html(merged_original_tree, W, H)
+
+    # Regenerate AI HTML if present
+    if merged.get('Ai') and getattr(core, 'DO_AI_HTML', True):
+        core.fit_tree_font_sizes_for_tp_html(merged_ai_tree, thai_font, latin_font, W, H)
+        merged['Ai']['aihtml'] = core.ai_tree_to_tp_html(merged_ai_tree, W, H)
+        merged['Ai']['aihtmlMeta'] = {'baseW': int(W), 'baseH': int(H), 'format': 'tp'}
+
+    # Combine rendered images
+    if merged_images:
+        final_img = core.Image.new("RGB", (W, H))
+        for y, chunk_img in merged_images:
+            final_img.paste(chunk_img, (0, y))
+        buf = io.BytesIO()
+        final_img.save(buf, format="PNG")
+        merged['imageDataUri'] = _bytes_to_datauri(buf.getvalue(), "image/png")
+
+    # htmlMeta fixes
+    merged['htmlMeta'] = {
+        'baseW': int(W),
+        'baseH': int(H),
+        'format': 'tp',
+    }
+    
+    return merged
 
 app = FastAPI(title='TextPhantom OCR API', version='1.0')
 app.add_middleware(
