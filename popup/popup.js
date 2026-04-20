@@ -154,6 +154,8 @@ const aiPromptWrap = document.getElementById("ai-prompt-wrap");
 const aiPromptInput = document.getElementById("ai-prompt");
 const aiPromptCountEl = document.getElementById("ai-prompt-count");
 const aiPromptResetBtn = document.getElementById("ai-prompt-reset");
+const aiKeyStatusEl = document.getElementById("ai-key-status");
+const aiKeyErrorEl = document.getElementById("ai-key-error");
 const apiInput = document.getElementById("api-url");
 const emojiEl = document.getElementById("api-status-emoji");
 const resetBtn = document.getElementById("reset-api");
@@ -232,6 +234,42 @@ function setEmojiStatus(type, detail) {
   } else {
     emojiEl.textContent = "❌";
     emojiEl.title = detail || "Offline / Not reachable";
+  }
+}
+
+function setAiKeyStatus(type, detail, errorDetail) {
+  if (!aiKeyStatusEl) return;
+  if (type === "loading") {
+    aiKeyStatusEl.textContent = "⏳";
+    aiKeyStatusEl.title = detail || "Validating key...";
+  } else if (type === "ok") {
+    aiKeyStatusEl.textContent = "✅";
+    aiKeyStatusEl.title = detail || "Key valid";
+  } else if (type === "error") {
+    aiKeyStatusEl.textContent = "❌";
+    aiKeyStatusEl.title = detail || "Key invalid";
+  } else if (type === "warning") {
+    aiKeyStatusEl.textContent = "⚠️";
+    aiKeyStatusEl.title = detail || "Warning";
+  } else {
+    aiKeyStatusEl.textContent = "";
+    aiKeyStatusEl.title = "";
+  }
+
+  if (aiKeyErrorEl) {
+    if (errorDetail && (type === "error" || type === "warning")) {
+      aiKeyErrorEl.textContent = errorDetail;
+      aiKeyErrorEl.className = "ai-status-msg status-" + type;
+      aiKeyErrorEl.style.display = "";
+    } else if (type === "ok" && detail) {
+      aiKeyErrorEl.textContent = detail;
+      aiKeyErrorEl.className = "ai-status-msg status-ok";
+      aiKeyErrorEl.style.display = "";
+    } else {
+      aiKeyErrorEl.style.display = "none";
+      aiKeyErrorEl.textContent = "";
+      aiKeyErrorEl.className = "ai-status-msg";
+    }
   }
 }
 
@@ -555,13 +593,22 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
   const source = (sourcesSel.value || "").trim() || "translated";
   if (source !== "ai") {
     setModelOptions([], { keepValue: "auto" });
+    setAiKeyStatus("none");
     return;
   }
 
   const seq = ++aiMetaSeq;
+  const aiKey = (aiKeyInput.value || "").trim();
+
+  if (!aiKey) {
+    setAiKeyStatus("none");
+    return;
+  }
+
+  setAiKeyStatus("loading", "Validating key...");
+
   try {
     const lang = langSel.value || "en";
-    const aiKey = (aiKeyInput.value || "").trim();
     const currentModel =
       (aiModelSel.value || "").trim() || desiredAiModel || "auto";
 
@@ -574,6 +621,40 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
     if (seq !== aiMetaSeq) return;
 
     if (!data || !data.ok) {
+      const errCode = String(data?.error || "").trim();
+      const errDetail = String(data?.error_detail || "").trim();
+      let shortMsg = "Key invalid";
+      let longMsg = "";
+
+      if (errCode === "missing_api_key") {
+        shortMsg = "No API key provided";
+        longMsg = "Please enter your AI API key.";
+      } else if (errCode === "invalid_api_key") {
+        shortMsg = "Invalid API key";
+        longMsg = errDetail || "The API key was rejected by the provider. Please check and re-enter.";
+      } else if (errCode === "auth_error") {
+        shortMsg = "Authentication failed";
+        longMsg = errDetail || "Could not authenticate with the AI provider.";
+      } else if (errCode === "rate_limited") {
+        shortMsg = "Rate limited";
+        longMsg = errDetail || "Too many requests. Please wait a moment and try again.";
+        setAiKeyStatus("warning", shortMsg, longMsg);
+        setModelOptions([], { keepValue: currentModel, strict: false });
+        toggleUi();
+        return;
+      } else if (errCode === "provider_error") {
+        shortMsg = "Provider error";
+        longMsg = errDetail || "Could not connect to the AI provider.";
+      } else if (errCode === "connection_error") {
+        shortMsg = "Connection error";
+        longMsg = errDetail || "Could not reach the AI provider's API.";
+      } else if (errDetail) {
+        longMsg = errDetail;
+      } else if (errCode) {
+        longMsg = `Error: ${errCode}`;
+      }
+
+      setAiKeyStatus("error", shortMsg, longMsg || shortMsg);
       setModelOptions([], { keepValue: currentModel, strict: false });
       toggleUi();
       return;
@@ -623,10 +704,45 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
       await chrome.storage.local.set({ aiKey });
     }
 
+    // Show success status
+    const providerLabel = provider
+      ? provider.charAt(0).toUpperCase() + provider.slice(1)
+      : "AI";
+    const modelCount = models.length;
+    const okMsg = modelCount
+      ? `✓ ${providerLabel} — ${modelCount} model${modelCount > 1 ? "s" : ""} available`
+      : `✓ ${providerLabel} connected`;
+    setAiKeyStatus("ok", okMsg, okMsg);
+
     if (forcePrompt) await applyPromptForLang(lang, { forceFetch: true });
 
     toggleUi();
-  } catch {}
+  } catch (err) {
+    if (seq !== aiMetaSeq) return;
+    const msg = err?.message || String(err);
+    let shortMsg = "Validation failed";
+    let longMsg = msg;
+
+    if (err?.name === "AbortError" || msg.includes("abort")) {
+      shortMsg = "Timeout";
+      longMsg = "Key validation timed out. The API server may be slow or unreachable.";
+    } else if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+      shortMsg = "Network error";
+      longMsg = "Cannot reach the API server. Make sure it is running.";
+    } else if (msg.includes("status 4")) {
+      const m = msg.match(/status\s*(\d+)/);
+      const code = m ? m[1] : "";
+      if (code === "401" || code === "403") {
+        shortMsg = "Invalid API key";
+        longMsg = `Server returned HTTP ${code}. The key may be wrong or expired.`;
+      } else {
+        shortMsg = `HTTP error ${code}`;
+        longMsg = msg;
+      }
+    }
+
+    setAiKeyStatus("error", shortMsg, longMsg);
+  }
 }
 
 function canUseAiUi() {
@@ -1020,7 +1136,18 @@ sourcesSel.addEventListener("change", async () => {
 apiInput.addEventListener("input", (e) => scheduleSaveApi(e.target.value));
 apiInput.addEventListener("blur", (e) => scheduleSaveApi(e.target.value));
 
+let lastKnownEmpty = true;
 aiKeyInput.addEventListener("input", () => {
+  const v = (aiKeyInput.value || "").trim();
+  if (lastKnownEmpty && v && sourcesSel && modeSel) {
+    if (sourcesSel.value !== "ai" || modeSel.value !== "lens_text") {
+      sourcesSel.value = "ai";
+      modeSel.value = "lens_text";
+      desiredSources = "ai";
+      chrome.storage.local.set({ mode: "lens_text", sources: "ai" });
+    }
+  }
+  lastKnownEmpty = (v === "");
   modelDirty = false;
   toggleUi();
   scheduleSaveAi();

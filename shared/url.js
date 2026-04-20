@@ -6,10 +6,8 @@ export function normalizeUrl(raw) {
   try {
     const cleaned = url.replace(/\/+$/, "");
     const u = new URL(cleaned);
-    if (u.hostname === "0.0.0.0" || u.hostname === "127.0.0.1") {
-      u.hostname = "localhost";
-    } else if (u.hostname === "[::1]") {
-      u.hostname = "localhost";
+    if (u.hostname === "0.0.0.0" || u.hostname === "localhost" || u.hostname === "[::1]") {
+      u.hostname = "127.0.0.1";
     }
     return u.toString().replace(/\/+$/, "");
   } catch {

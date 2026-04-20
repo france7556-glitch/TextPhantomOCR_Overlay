@@ -1,4 +1,4 @@
-export const AI_PROMPT_MAX_CHARS = 1800;
+export const AI_PROMPT_MAX_CHARS = 8192;
 
 export function normalizeAiModel(model) {
   const m = String(model || '').trim();

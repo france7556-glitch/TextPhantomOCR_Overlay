@@ -1044,17 +1044,20 @@ def _process_payload(payload: dict) -> dict:
     img_bytes = b''
     mime = ''
 
-    if payload.get('imageDataUri'):
-        img_bytes, mime = _datauri_to_bytes(payload.get('imageDataUri'))
-    elif src.startswith('data:'):
-        img_bytes, mime = _datauri_to_bytes(src)
-    else:
-        img_bytes, mime = _download_bytes(src, page_url)
+    try:
+        if payload.get('imageDataUri'):
+            img_bytes, mime = _datauri_to_bytes(payload.get('imageDataUri'))
+        elif src.startswith('data:'):
+            img_bytes, mime = _datauri_to_bytes(src)
+        else:
+            img_bytes, mime = _download_bytes(src, page_url)
+    except Exception as e:
+        raise Exception(f'[download] {e}') from e
 
     t_img = time.perf_counter()
 
     if not img_bytes:
-        raise Exception('No image data')
+        raise Exception('[download] No image data')
 
     ai_cfg = None
     ai = payload.get('ai') or None
@@ -1097,7 +1100,19 @@ def _process_payload(payload: dict) -> dict:
         tmp_path = f.name
     t_tmp = time.perf_counter()
     try:
-        out = process_image_path(tmp_path, lang, mode, ai_cfg)
+        try:
+            out = process_image_path(tmp_path, lang, mode, ai_cfg)
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(kw in err_str for kw in ('ai ', 'ai_', 'openai', 'gemini', 'anthropic', 'api_key', 'api key',
+                                             'rate limit', 'ratelimit', '429', 'quota',
+                                             'model', 'generate', 'chat/completions')):
+                raise Exception(f'[ai] {e}') from e
+            elif any(kw in err_str for kw in ('cannot identify image', 'image file is truncated',
+                                                'unsupported', 'decode', 'pixel')):
+                raise Exception(f'[ocr] {e}') from e
+            else:
+                raise Exception(f'[render] {e}') from e
         out['perf'] = {
             'cache': 'miss' if cache_key else 'off',
             'total_ms': round((time.perf_counter() - t_all) * 1000, 1),
@@ -1117,6 +1132,7 @@ def _process_payload(payload: dict) -> dict:
             os.unlink(tmp_path)
         except Exception:
             pass
+
 
 @app.on_event('startup')
 async def _startup():
@@ -1183,6 +1199,7 @@ async def ai_resolve(payload: Dict[str, Any]):
         return {
             'ok': False,
             'error': 'missing_api_key',
+            'error_detail': 'No API key provided. Please enter your AI API key.',
             'provider': '',
             'default_model': '',
             'models': [],
@@ -1203,48 +1220,106 @@ async def ai_resolve(payload: Dict[str, Any]):
     if base_url in ('', 'auto'):
         base_url = (preset.get('base_url') or '').strip()
 
-    if provider == 'huggingface':
-        if base_url:
-            models = core._hf_router_available_models(api_key, base_url)
-        if requested_model.lower() in ('', 'auto'):
-            fallback = core._pick_hf_fallback_model(models)
-            if fallback:
-                resolved_model = fallback
+    validation_error = None
 
-    elif provider == 'gemini':
-        models = getattr(core, '_gemini_available_models',
-                         lambda _k: [])(api_key)
-        if not models:
-            models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro',
-                      'gemini-2.0-flash', 'gemini-3-flash-preview', 'gemini-3-pro-preview']
+    try:
+        if provider == 'huggingface':
+            if base_url:
+                models = core._hf_router_available_models(api_key, base_url)
+            if requested_model.lower() in ('', 'auto'):
+                fallback = core._pick_hf_fallback_model(models)
+                if fallback:
+                    resolved_model = fallback
 
-    elif provider == 'anthropic':
-        models = getattr(core, '_anthropic_available_models',
-                         lambda _k, _b=None: [])(api_key, base_url)
+        elif provider == 'gemini':
+            models = getattr(core, '_gemini_available_models',
+                             lambda _k: [])(api_key)
+            if not models:
+                models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro',
+                          'gemini-2.0-flash', 'gemini-3-flash-preview', 'gemini-3-pro-preview']
 
-    elif provider == 'local':
-        if not base_url:
-            base_url = (core.AI_PROVIDER_DEFAULTS.get('local') or {}).get(
-                'base_url') or 'http://127.0.0.1:8080/v1'
-        try:
-            models_url = base_url.rstrip('/') + '/models'
-            with httpx.Client(timeout=8.0) as client:
-                r = client.get(models_url)
-                if r.status_code == 200:
-                    data = r.json()
-                    for m in (data.get('data') or []):
-                        mid = (m.get('id') if isinstance(m, dict) else None)
-                        if isinstance(mid, str) and mid.strip():
-                            models.append(mid.strip())
-        except Exception:
-            pass
+        elif provider == 'anthropic':
+            models = getattr(core, '_anthropic_available_models',
+                             lambda _k, _b=None: [])(api_key, base_url)
 
-    else:
-        if not base_url:
-            base_url = (core.AI_PROVIDER_DEFAULTS.get('openai') or {}).get(
-                'base_url') or 'https://api.openai.com/v1'
-        models = getattr(core, '_openai_compat_available_models',
-                         lambda _k, _b: [])(api_key, base_url)
+        elif provider == 'local':
+            if not base_url:
+                base_url = (core.AI_PROVIDER_DEFAULTS.get('local') or {}).get(
+                    'base_url') or 'http://127.0.0.1:8080/v1'
+            try:
+                models_url = base_url.rstrip('/') + '/models'
+                with httpx.Client(timeout=8.0) as client:
+                    r = client.get(models_url)
+                    if r.status_code == 200:
+                        data = r.json()
+                        for m in (data.get('data') or []):
+                            mid = (m.get('id') if isinstance(m, dict) else None)
+                            if isinstance(mid, str) and mid.strip():
+                                models.append(mid.strip())
+                    else:
+                        validation_error = {
+                            'error': 'connection_error',
+                            'error_detail': f'Local AI server returned HTTP {r.status_code}. Make sure the server is running at {base_url}',
+                        }
+            except httpx.ConnectError:
+                validation_error = {
+                    'error': 'connection_error',
+                    'error_detail': f'Cannot connect to local AI server at {base_url}. Make sure it is running.',
+                }
+            except Exception as e:
+                validation_error = {
+                    'error': 'connection_error',
+                    'error_detail': f'Error connecting to local AI: {str(e)[:200]}',
+                }
+
+        else:
+            if not base_url:
+                base_url = (core.AI_PROVIDER_DEFAULTS.get('openai') or {}).get(
+                    'base_url') or 'https://api.openai.com/v1'
+            models = getattr(core, '_openai_compat_available_models',
+                             lambda _k, _b: [])(api_key, base_url)
+
+    except Exception as e:
+        err_str = str(e).lower()
+        err_detail = str(e)[:300]
+
+        if '401' in err_str or 'unauthorized' in err_str or 'invalid.*key' in err_str.replace(' ', ''):
+            validation_error = {
+                'error': 'invalid_api_key',
+                'error_detail': f'API key rejected by {provider or "provider"}: {err_detail}',
+            }
+        elif '403' in err_str or 'forbidden' in err_str or 'permission' in err_str:
+            validation_error = {
+                'error': 'auth_error',
+                'error_detail': f'Access denied by {provider or "provider"}: {err_detail}',
+            }
+        elif '429' in err_str or 'rate limit' in err_str or 'too many' in err_str:
+            validation_error = {
+                'error': 'rate_limited',
+                'error_detail': f'Rate limited by {provider or "provider"}. Wait a moment and try again.',
+            }
+        elif 'connect' in err_str or 'timeout' in err_str or 'resolv' in err_str:
+            validation_error = {
+                'error': 'connection_error',
+                'error_detail': f'Cannot reach {provider or "provider"} API: {err_detail}',
+            }
+        else:
+            validation_error = {
+                'error': 'provider_error',
+                'error_detail': f'Error from {provider or "provider"}: {err_detail}',
+            }
+
+    if validation_error and not models:
+        return {
+            'ok': False,
+            'provider': provider or '',
+            'base_url': base_url or '',
+            'default_model': (preset.get('model') or ''),
+            'models': [],
+            'lang': lang,
+            'prompt_editable_default': style_default,
+            **validation_error,
+        }
 
     if provider == 'huggingface' and not models:
         models = [

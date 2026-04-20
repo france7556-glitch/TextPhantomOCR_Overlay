@@ -26,15 +26,24 @@
       </div>
 
       <div class="field" id="ai-key-wrap">
-        <label for="ai-key">AI Key (optional)</label>
+        <label for="ai-key">AI Key (optional)
+          <span
+            id="ai-key-status"
+            aria-live="polite"
+            title=""
+            style="margin-left: 6px"
+          ></span>
+        </label>
         <input
           type="password"
           id="ai-key"
           placeholder="Paste your AI_API_KEY or type 'local' for local AI"
         />
+        <div id="ai-key-error" class="ai-status-msg" style="display: none"></div>
         <div class="hint">
-          If empty, the extension will use translated overlay (no AI).<br />
-          For local AI (llama-server / Ollama / LM Studio), type <strong>local</strong> as the key.
+          <strong>For OpenRouter / Gemini:</strong> Paste your API Key here (`sk-or-v1-...`).<br />
+          <strong>For Local AI (llama-server etc):</strong> Type `local`.<br />
+          <em>Note:</em> The Mode must be "Google Lens (text)" and Sources "Ai" to use this.
         </div>
       </div>
 

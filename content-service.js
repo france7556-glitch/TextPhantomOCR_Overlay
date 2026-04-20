@@ -2066,7 +2066,8 @@
         sendResp({ ok: true });
         return;
       }
-      const { mode, lang } = await getSettings();
+      const { mode, lang, sources } = await getSettings();
+      const source = String(mode || "").includes("text") ? String(sources || "translated") : "translated";
       try {
         log.debug("MSG", {
           type: msg?.type,
@@ -2100,7 +2101,18 @@
             if (!k) return false;
             const rec = mdCacheItems[k];
             if (!rec) return false;
-            return wantsHtml ? Boolean(rec.result) : Boolean(rec.hasNewImg);
+            if (wantsHtml) {
+              if (!rec.result) return false;
+              // If user wants AI source, check that the cached result actually has AI content
+              // Otherwise it will skip pages that were cached without AI translation
+              if (source === "ai") {
+                const aiHtml = rec.result?.Ai?.aihtml || rec.result?.ai?.aihtml || "";
+                const aiMeta = rec.result?.Ai?.meta || rec.result?.ai?.meta || {};
+                if (!aiHtml && !aiMeta.skipped) return false;
+              }
+              return true;
+            }
+            return Boolean(rec.hasNewImg);
           };
           const seen = new Set();
           const posBySrc = new Map();

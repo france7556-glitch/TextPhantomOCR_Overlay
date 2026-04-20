@@ -44,8 +44,8 @@ AI_MODEL = "auto"
 AI_BASE_URL = "auto"
 AI_TEMPERATURE = 0.2
 
-AI_MAX_TOKENS = 1200
-AI_TIMEOUT_SEC = 120
+AI_MAX_TOKENS = 4096
+AI_TIMEOUT_SEC = 600
 
 DRAW_BOX_OUTLINE = True
 AUTO_TEXT_COLOR = True
@@ -349,7 +349,7 @@ AI_PROVIDER_DEFAULTS = {
         "base_url": "https://api.openai.com/v1",
     },
     "openrouter": {
-        "model": "openai/o4-mini",
+        "model": "google/gemma-4-31b-it:free",
         "base_url": "https://openrouter.ai/api/v1",
     },
     "huggingface": {

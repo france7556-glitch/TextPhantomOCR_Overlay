@@ -28,6 +28,9 @@ const WS_RETRIES = 6;
 const MAX_FIRST_TRY_RETRIES = 2;
 const FIRST_TRY_GAP_MS = 3000;
 
+const REST_POLL_TIMEOUT_MS = 180000;
+const REST_POLL_TIMEOUT_AI_MS = 660000;
+
 const WARMUP_PATH = "/warmup";
 const WARMUP_TIMEOUT_MS = 2500;
 const WARMUP_TTL_MS = 20 * 60 * 1000;
@@ -233,11 +236,29 @@ function batchUpdateToast(b, stage, force = false) {
   if (s.processing || s.inserting || s.queued)
     parts.push(`ประมวลผล ${s.processing + s.inserting}/${total}`);
   if (s.done) parts.push(`แทรกกลับ ${s.done}/${total}`);
-  if (s.error) parts.push(`ผิดพลาด ${s.error}`);
+  if (s.error) {
+    const errCounts = {};
+    for (const it of b?.items?.values?.() || []) {
+      if (it?.status === "error" && it?.lastError) {
+        const cls = classifyJobError(it.lastError);
+        const label = cls?.userMsg || "ไม่ทราบสาเหตุ";
+        errCounts[label] = (errCounts[label] || 0) + 1;
+      }
+    }
+    const errEntries = Object.entries(errCounts);
+    if (errEntries.length === 1) {
+      parts.push(`ผิดพลาด ${s.error} (${errEntries[0][0]})`);
+    } else if (errEntries.length > 1) {
+      const summary = errEntries.map(([k, v]) => `${v}×${k}`).join(", ");
+      parts.push(`ผิดพลาด ${s.error} (${summary})`);
+    } else {
+      parts.push(`ผิดพลาด ${s.error}`);
+    }
+  }
   if (s.aborted) parts.push(`ยกเลิก ${s.aborted}`);
   const extra = stage ? `• ${stage}` : "";
   const msg = `${head} ${parts.join(" | ")} ${extra}`.trim();
-  const ms = s.finished >= total && total ? 2400 : 60000;
+  const ms = s.finished >= total && total ? 2400 : 9999999;
   batchToast(b, msg, ms, force);
   lastBatchStatus = {
     id: b.id,
@@ -398,7 +419,8 @@ function batchFinalizeIfComplete(b) {
               permanent: !!cls?.permanent,
             });
             if (cls?.permanent) {
-              batchUpdateToast(b, "ผิดพลาด (ถาวร)");
+              const msg = cls.userMsg ? `ผิดพลาด (ถาวร: ${cls.userMsg})` : "ผิดพลาด (ถาวร)";
+              batchUpdateToast(b, msg);
               batchFinalizeIfComplete(b);
             }
           }
@@ -552,34 +574,55 @@ async function fetchImageDataUriFromUrl(url, pageUrl) {
     cache: "force-cache",
     referrer: pageUrl || "about:client",
   });
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  if (!res.ok) throw new Error("[download] HTTP " + res.status);
   const ct = String(res.headers.get("content-type") || "");
   const mime = ct.split(";")[0].trim();
   if (mime && !mime.toLowerCase().startsWith("image/")) {
     const body = await readLimitedText(res);
-    throw new Error(`Not an image: ${mime}${body ? ` - ${body}` : ""}`);
+    throw new Error(`[download] Not an image: ${mime}${body ? ` - ${body}` : ""}`);
   }
   const blob = await res.blob();
-  if (blob.size < 64) throw new Error("Image too small");
-  if (blob.size > 25 * 1024 * 1024) throw new Error("Image too large");
+  if (blob.size < 64) throw new Error("[download] Image too small");
+  if (blob.size > 25 * 1024 * 1024) throw new Error("[download] Image too large");
   return await blobToDataUri(blob, mime || blob.type);
+}
+
+function _detectStage(msg) {
+  const m = String(msg || "");
+  if (m.startsWith("[download]") || m.includes("[download]")) return "download";
+  if (m.startsWith("[ai]") || m.includes("[ai]")) return "ai";
+  if (m.startsWith("[ocr]") || m.includes("[ocr]")) return "ocr";
+  if (m.startsWith("[render]") || m.includes("[render]")) return "render";
+  return "";
 }
 
 function classifyJobError(msg) {
   const m = String(msg || "").toLowerCase();
-  if (!m) return { permanent: false };
-  if (m.includes("no overlay data")) return { permanent: true };
-  if (m.includes("no image data")) return { permanent: true };
-  if (/\bhttp\s*(401|403|404|410)\b/.test(m) || /\b(401|403|404|410)\b/.test(m))
-    return { permanent: true };
-  if (m.includes("not an image")) return { permanent: true };
+  if (!m) return { permanent: false, userMsg: "", stage: "" };
+  const stage = _detectStage(msg);
+  const stageLabel = stage ? `[${stage}] ` : "";
+  if (m.includes("no overlay data")) return { permanent: true, userMsg: `${stageLabel}ไม่พบข้อความในภาพ`, stage };
+  if (m.includes("no image data")) return { permanent: true, userMsg: `${stageLabel}ไม่มีข้อมูลภาพ`, stage: stage || "download" };
+  if (m.includes("ai api_key is required") || m.includes("missing_api_key"))
+    return { permanent: true, userMsg: `[ai] ไม่มี AI Key`, stage: "ai" };
+  if ((m.includes("401") || m.includes("unauthorized")) && (m.includes("ai") || m.includes("api_key") || m.includes("key")))
+    return { permanent: true, userMsg: `[ai] Key ไม่ถูกต้อง (401)`, stage: "ai" };
+  if ((m.includes("403") || m.includes("forbidden")) && (m.includes("ai") || m.includes("api_key") || m.includes("key")))
+    return { permanent: true, userMsg: `[ai] Key ถูกปฏิเสธ (403)`, stage: "ai" };
+  if (/\bhttp\s*(401|403|404|410)\b/.test(m) || /\b(401|403|404|410)\b/.test(m)) {
+    const code = m.match(/\b(401|403|404|410)\b/)?.[1] || "";
+    return { permanent: true, userMsg: `${stageLabel}HTTP ${code}`, stage };
+  }
+  if (m.includes("not an image")) return { permanent: true, userMsg: `${stageLabel}ไฟล์ไม่ใช่ภาพ`, stage: stage || "download" };
   if (
     m.includes("cannot identify image") ||
     m.includes("image file is truncated")
   )
-    return { permanent: true };
+    return { permanent: true, userMsg: `[ocr] ภาพเสียหาย`, stage: "ocr" };
   if (m.includes("unsupported") && m.includes("image"))
-    return { permanent: true };
+    return { permanent: true, userMsg: `[ocr] รูปแบบภาพไม่รองรับ`, stage: "ocr" };
+  if (m.includes("model") && (m.includes("not found") || m.includes("not exist")))
+    return { permanent: true, userMsg: `[ai] Model ไม่พบ`, stage: "ai" };
   if (
     m.includes("rate limit") ||
     m.includes("ratelimit") ||
@@ -587,16 +630,38 @@ function classifyJobError(msg) {
     m.includes("http 429") ||
     m.includes(" 429")
   )
-    return { permanent: false };
+    return { permanent: false, userMsg: `${stageLabel}Rate limit`, stage };
   if (
     m.includes("http 503") ||
     m.includes(" 503") ||
     m.includes("overloaded") ||
     m.includes("temporarily")
   )
-    return { permanent: false };
-  if (m.includes("timeout")) return { permanent: false };
-  return { permanent: false };
+    return { permanent: false, userMsg: `${stageLabel}เซิร์ฟเวอร์ไม่ว่าง`, stage };
+  if (m.includes("timeout") || m.includes("timed out")) {
+    const s = stage || (m.includes("poll") ? "api" : (m.includes("ai") ? "ai" : ""));
+    return { permanent: false, userMsg: `[${s || "api"}] หมดเวลา`, stage: s || "api" };
+  }
+  if (m.includes("failed to fetch") || m.includes("network error") || m.includes("econnrefused"))
+    return { permanent: false, userMsg: `${stageLabel}เชื่อมต่อ API ล้มเหลว`, stage: stage || "api" };
+  if (m.includes("safety") || m.includes("filter") || m.includes("blocked") || m.includes("policy"))
+    return { permanent: true, userMsg: `${stageLabel}ถูกบล็อก (Safety)`, stage };
+  if (m.includes("internal server error") || m.includes("http 500") || m.includes(" 500"))
+    return { permanent: false, userMsg: `${stageLabel}เซิร์ฟเวอร์ AI ขัดข้อง (500)`, stage };
+  if (m.includes("โควต้า ai หมด") || m.includes("quota") || m.includes("insufficient") || m.includes("payment required") || m.includes("402"))
+    return { permanent: true, userMsg: `[ai] โควต้าหมด (402)`, stage: "ai" };
+  if (m.includes("rest submit failed"))
+    return { permanent: false, userMsg: `[api] ส่งงานล้มเหลว`, stage: "api" };
+  if (m.includes("rest poll failed"))
+    return { permanent: false, userMsg: `[api] ตรวจสอบงานล้มเหลว`, stage: "api" };
+
+  // Fallback: If unknown, show a snippet of the actual message
+  const snippet = msg.length > 40 ? msg.substring(0, 37) + "..." : msg;
+  return { 
+    permanent: false, 
+    userMsg: stageLabel ? `${stageLabel}ผิดพลาด (${snippet})` : `ผิดพลาด (${snippet})`, 
+    stage 
+  };
 }
 
 function mdKeyFromUrl(url) {
@@ -1245,12 +1310,15 @@ function handleJobError(jobId, errMsg = "Unknown error") {
     ? ensureBatch(batchId, ctx?.tabId || 0, ctx?.frameId || 0)
     : null;
 
-  if (ctx?.tabId && !isStale)
+  if (ctx?.tabId && !isStale) {
+    const userMsg = cls?.userMsg || "";
+    const displayMsg = userMsg ? `${userMsg}: ${errMsg}` : errMsg;
     sendToTab(
       ctx.tabId,
-      { type: "IMAGE_ERROR", original: ctx.imgUrl, message: errMsg },
+      { type: "IMAGE_ERROR", original: ctx.imgUrl, message: displayMsg },
       ctx.frameId || 0,
     );
+  }
 
   pendingByJob.delete(jobId);
   ev("job.done", {
@@ -1265,7 +1333,9 @@ function handleJobError(jobId, errMsg = "Unknown error") {
       lastError: errMsg,
       permanent: !!cls?.permanent,
     });
-    batchUpdateToast(batch, cls?.permanent ? "ผิดพลาด (ถาวร)" : "ผิดพลาด");
+    batchUpdateToast(batch, cls?.permanent
+      ? (cls?.userMsg ? `ผิดพลาด (${cls.userMsg})` : "ผิดพลาด (ถาวร)")
+      : (cls?.userMsg ? `ผิดพลาด (${cls.userMsg})` : "ผิดพลาด"));
     batchFinalizeIfComplete(batch);
   }
 }
@@ -1613,7 +1683,7 @@ async function processJob(payload, tabId, frameId = 0) {
         keepCacheOnStale: isMd,
         settingsEpoch,
       });
-      await pollJobViaRest(base, jid);
+      await pollJobViaRest(base, jid, { timeoutMs: payload?.source === "ai" ? REST_POLL_TIMEOUT_AI_MS : REST_POLL_TIMEOUT_MS });
       return;
     } catch (e) {
       const msg = e?.message || String(e);
@@ -1630,7 +1700,8 @@ async function processJob(payload, tabId, frameId = 0) {
           lastError: msg,
           permanent: !!cls?.permanent,
         });
-        batchUpdateToast(batch, cls?.permanent ? "ผิดพลาด (ถาวร)" : "ผิดพลาด");
+        const tMsg = cls?.userMsg ? `ผิดพลาด (${cls.userMsg})` : (cls?.permanent ? "ผิดพลาด (ถาวร)" : "ผิดพลาด");
+        batchUpdateToast(batch, tMsg);
         batchFinalizeIfComplete(batch);
       }
       const jobId = crypto.randomUUID();
@@ -1666,7 +1737,7 @@ async function processJob(payload, tabId, frameId = 0) {
               keepCacheOnStale: isMd,
               settingsEpoch,
             });
-            await pollJobViaRest(base, jid);
+            await pollJobViaRest(base, jid, { timeoutMs: payload?.source === "ai" ? REST_POLL_TIMEOUT_AI_MS : REST_POLL_TIMEOUT_MS });
             return;
           } catch (e) {
             const msg = e?.message || String(e);
