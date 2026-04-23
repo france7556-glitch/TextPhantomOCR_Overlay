@@ -1,4 +1,4 @@
-import base64, copy, hashlib, json, math, os, re, struct, time, unicodedata, cv2, httpx, numpy as np, budoux
+import base64, copy, hashlib, json, math, os, re, struct, time, unicodedata, cv2, httpx, numpy as np, budoux, threading
 
 from urllib.parse import parse_qs, urlencode, urlparse
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -57,6 +57,9 @@ BOX_OUTLINE_WIDTH = 2
 
 DRAW_OUTLINE_PARA = False
 DRAW_OUTLINE_ITEM = False
+AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "4"))
+_ai_semaphore = threading.Semaphore(AI_MAX_CONCURRENCY)
+
 DRAW_OUTLINE_SPAN = False
 PARA_OUTLINE = (0, 0, 255, 255)
 ITEM_OUTLINE = (255, 0, 0, 255)
@@ -409,6 +412,8 @@ AI_MODEL_ALIASES = {
         "3-pro": "gemini-3-pro-preview",
         "3-pro-image": "gemini-3-pro-image-preview",
         "flash-image": "gemini-2.5-flash-image",
+        "gemma-4": "gemma-4-preview",
+        "gemma-3": "gemma-3-27b-it",
     }
 }
 
@@ -653,13 +658,19 @@ def _gemini_generate_json(api_key: str, model: str, system_text: str, user_parts
             "responseMimeType": "text/plain",
         },
     }
-    with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
-        r = client.post(url, json=payload)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise Exception(f"Gemini HTTP {r.status_code}: {r.text}") from e
-        data = r.json()
+    for attempt in range(4):
+        with _ai_semaphore:
+            with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
+                r = client.post(url, json=payload)
+                try:
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+                except httpx.HTTPStatusError as e:
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise Exception(f"Gemini HTTP {r.status_code}: {r.text}") from e
     candidates = data.get("candidates") or []
     if not candidates:
         raise Exception("Gemini returned no candidates")
@@ -751,44 +762,54 @@ def _openai_compat_generate_json(api_key: str, base_url: str, model: str, system
         "Content-Type": "application/json",
     }
     used_model = model
-    with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
-        r = client.post(url, json=payload, headers=headers)
-        try:
-            r.raise_for_status()
-            data = r.json()
-        except httpx.HTTPStatusError as e:
-            if (
-                r.status_code == 400
-                and "router.huggingface.co" in (base_url or "")
-                and ((AI_MODEL or "").strip().lower() in ("", "auto") or model == (AI_PROVIDER_DEFAULTS.get("huggingface") or {}).get("model"))
-            ):
+    for attempt in range(4):
+        with _ai_semaphore:
+            with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
+                r = client.post(url, json=payload, headers=headers)
                 try:
-                    err = r.json().get("error") or {}
-                except Exception:
-                    err = {}
-                if (err.get("code") or "") == "model_not_supported":
-                    models = _hf_router_available_models(api_key, base_url)
-                    fallback = _pick_hf_fallback_model(models)
-                    if fallback and fallback != model:
-                        payload["model"] = fallback
-                        used_model = fallback
-                        r2 = client.post(url, json=payload, headers=headers)
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+                except httpx.HTTPStatusError as e:
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    if (
+                        r.status_code == 400
+                        and "router.huggingface.co" in (base_url or "")
+                        and ((AI_MODEL or "").strip().lower() in ("", "auto") or model == (AI_PROVIDER_DEFAULTS.get("huggingface") or {}).get("model"))
+                    ):
                         try:
-                            r2.raise_for_status()
-                        except httpx.HTTPStatusError as e2:
+                            err = r.json().get("error") or {}
+                        except Exception:
+                            err = {}
+                        if (err.get("code") or "") == "model_not_supported":
+                            models = _hf_router_available_models(api_key, base_url)
+                            fallback = _pick_hf_fallback_model(models)
+                            if fallback and fallback != model:
+                                payload["model"] = fallback
+                                used_model = fallback
+                                r2 = client.post(url, json=payload, headers=headers)
+                                try:
+                                    r2.raise_for_status()
+                                except httpx.HTTPStatusError as e2:
+                                    if r2.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                                        time.sleep(2 ** attempt)
+                                        continue
+                                    raise Exception(
+                                        f"AI HTTP {r2.status_code}: {r2.text}") from e2
+                                data = r2.json()
+                                break
+                            else:
+                                preview = ", ".join(models[:8])
+                                hint = f"\nAvailable models (first 8): {preview}" if preview else ""
+                                raise Exception(
+                                    f"AI HTTP {r.status_code}: {r.text}{hint}") from e
+                        else:
                             raise Exception(
-                                f"AI HTTP {r2.status_code}: {r2.text}") from e2
-                        data = r2.json()
+                                f"AI HTTP {r.status_code}: {r.text}") from e
                     else:
-                        preview = ", ".join(models[:8])
-                        hint = f"\nAvailable models (first 8): {preview}" if preview else ""
-                        raise Exception(
-                            f"AI HTTP {r.status_code}: {r.text}{hint}") from e
-                else:
-                    raise Exception(
-                        f"AI HTTP {r.status_code}: {r.text}") from e
-            else:
-                raise Exception(f"AI HTTP {r.status_code}: {r.text}") from e
+                        raise Exception(f"AI HTTP {r.status_code}: {r.text}") from e
     choices = data.get("choices") or []
     if not choices:
         raise Exception("AI returned no choices")
@@ -815,13 +836,19 @@ def _anthropic_generate_json(api_key: str, model: str, system_text: str, user_pa
         "x-api-key": api_key,
         "content-type": "application/json",
     }
-    with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
-        r = client.post(url, json=payload, headers=headers)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise Exception(f"Anthropic HTTP {r.status_code}: {r.text}") from e
-        data = r.json()
+    for attempt in range(4):
+        with _ai_semaphore:
+            with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
+                r = client.post(url, json=payload, headers=headers)
+                try:
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+                except httpx.HTTPStatusError as e:
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise Exception(f"Anthropic HTTP {r.status_code}: {r.text}") from e
     content = data.get("content") or []
     txt = "".join([(c.get("text") or "") for c in content if isinstance(
         c, dict) and c.get("type") == "text"]).strip()

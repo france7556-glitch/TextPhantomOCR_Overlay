@@ -257,8 +257,13 @@ function batchUpdateToast(b, stage, force = false) {
   }
   if (s.aborted) parts.push(`ยกเลิก ${s.aborted}`);
   const extra = stage ? `• ${stage}` : "";
-  const msg = `${head} ${parts.join(" | ")} ${extra}`.trim();
-  const ms = s.finished >= total && total ? 2400 : 9999999;
+  let msg = "";
+  if (!total && parts.length === 0) {
+    msg = `${head} ไม่มีภาพใหม่ (แปลไปแล้ว/ภาพเล็กเกินไป)`;
+  } else {
+    msg = `${head} ${parts.join(" | ")} ${extra}`.trim();
+  }
+  const ms = (!total) ? 3000 : (s.finished >= total && total ? 2400 : 9999999);
   batchToast(b, msg, ms, force);
   lastBatchStatus = {
     id: b.id,
@@ -289,11 +294,15 @@ function batchMark(batchId, imageKey, patch) {
   return b;
 }
 
+const gracefulKAStopTabs = new Set();
+
 async function batchStopKeepAlive(b) {
   if (!b?.tabId) return;
+  gracefulKAStopTabs.add(b.tabId);
   try {
     await sendToTab(b.tabId, { type: "TP_KEEPALIVE_STOP" }, b.frameId || 0);
   } catch {}
+  setTimeout(() => gracefulKAStopTabs.delete(b.tabId), 10000);
 }
 
 function batchFinalizeIfComplete(b) {
@@ -1813,7 +1822,15 @@ const enqueue = (payload, tabId, frameId = 0) => {
   ).trim();
   addTask(() => {
     const cur = getTabSessionId(tabId);
-    if (expected && (!cur || expected !== cur)) return;
+    if (expected && (!cur || expected !== cur)) {
+      evWarn("enqueue.session.mismatch", {
+        tabId,
+        expected,
+        cur: cur || "(none)",
+        menu: payload?.menu || "",
+      });
+      return;
+    }
     return processJob(payload, tabId, frameId);
   });
 };
@@ -2181,6 +2198,11 @@ chrome.runtime.onConnect.addListener((port) => {
       keepAlivePorts.delete(port);
       if (!Number.isFinite(tabId)) return;
       if (Number.isFinite(frameId) && frameId !== 0) return;
+      if (gracefulKAStopTabs.has(tabId)) {
+        gracefulKAStopTabs.delete(tabId);
+        ev("keepalive.graceful_stop", { tabId });
+        return;
+      }
       bumpTabSession(tabId, "");
       cancelTabWork(tabId, "page_unloaded");
     });

@@ -1236,7 +1236,10 @@ async def ai_resolve(payload: Dict[str, Any]):
                              lambda _k: [])(api_key)
             if not models:
                 models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro',
-                          'gemini-2.0-flash', 'gemini-3-flash-preview', 'gemini-3-pro-preview']
+                          'gemini-2.0-flash', 'gemini-3-flash-preview', 'gemini-3-pro-preview',
+                          'gemma-2-2b-it', 'gemma-2-9b-it', 'gemma-2-27b-it',
+                          'gemma-3-4b-it', 'gemma-3-12b-it', 'gemma-3-27b-it', 'gemma-4-preview',
+                          'gemma-4-31b-it', 'gemma-4-26b-a4b-it']
 
         elif provider == 'anthropic':
             models = getattr(core, '_anthropic_available_models',
@@ -1349,6 +1352,15 @@ async def ai_resolve(payload: Dict[str, Any]):
                 'gemini-2.0-flash',
                 'gemini-3-flash-preview',
                 'gemini-3-pro-preview',
+                'gemma-2-2b-it',
+                'gemma-2-9b-it',
+                'gemma-2-27b-it',
+                'gemma-3-4b-it',
+                'gemma-3-12b-it',
+                'gemma-3-27b-it',
+                'gemma-4-preview',
+                'gemma-4-31b-it',
+                'gemma-4-26b-a4b-it',
             ])
 
         models = sorted(set([m for m in fallback_models if m]), key=str.lower)
