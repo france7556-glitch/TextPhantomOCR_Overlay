@@ -798,16 +798,17 @@
       .trim()
       .toLowerCase();
 
-    const chosen = req === "ai" || req === "original" ? req : "translated";
+    const isAiReq = req === "ai" || req === "cli" || req.startsWith("cli_");
+    const chosen = isAiReq || req === "original" ? req : "translated";
     const html =
-      chosen === "ai"
+      isAiReq
         ? aiHtml
         : chosen === "original"
           ? originalHtml
           : translatedHtml;
 
     const cssParts = [String(result?.htmlCss || "")];
-    if (chosen === "ai")
+    if (isAiReq)
       cssParts.push(
         String(result?.Ai?.aihtmlCss || result?.ai?.aihtmlCss || ""),
       );
@@ -847,7 +848,7 @@
 
     const mdKey = isMangaDexHost() ? mdGetKeyForImg(imgElement) : "";
     if (mdKey) {
-      if (isTextMode && req === "ai" && !aiHtml) {
+      if (isTextMode && isAiReq && !aiHtml) {
         const rec = upsertMangaDexHtmlOverlay(
           mdKey,
           imgElement,
@@ -932,7 +933,7 @@
     const key = _normUrl(original) || _normUrl(getBestImgUrl(imgElement));
     if (!key) return;
 
-    if (isTextMode && req === "ai" && !aiHtml) {
+    if (isTextMode && isAiReq && !aiHtml) {
       const rec = upsertHtmlOverlay(key, imgElement, baseW, baseH, "badge");
       updateCleanLayer(rec, imgElement, newImgSrc);
       rec.scope.textContent = "";

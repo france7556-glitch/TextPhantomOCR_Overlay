@@ -17,6 +17,8 @@ SUPPORTED_MODES = {"lens_images", "lens_text"}
 BUILD_ID = os.environ.get('TP_BUILD_ID', 'v9-backendfix-20260129')
 TP_DEBUG = str(os.environ.get('TP_DEBUG', '')).strip(
 ).lower() in ('1', 'true', 'yes', 'on')
+TP_TRACE = str(os.environ.get('TP_TRACE', '1')).strip(
+).lower() in ('1', 'true', 'yes', 'on')
 
 TP_PARA_MARKER_PREFIX = '<<TP_P'
 TP_PARA_MARKER_SUFFIX = '>>'
@@ -68,6 +70,23 @@ def _dbg(tag: str, data=None) -> None:
     except Exception:
         try:
             print(f'[TextPhantom][dbg] {tag} {data}')
+        except Exception:
+            pass
+
+def _trace(tag: str, data=None) -> None:
+    if not TP_TRACE:
+        return
+    try:
+        if data is None:
+            print(f'[TextPhantom][trace] {tag}', flush=True)
+        else:
+            s = json.dumps(data, ensure_ascii=False, default=str)
+            if len(s) > 2000:
+                s = s[:2000] + '...'
+            print(f'[TextPhantom][trace] {tag} {s}', flush=True)
+    except Exception:
+        try:
+            print(f'[TextPhantom][trace] {tag} {data}', flush=True)
         except Exception:
             pass
 
@@ -399,6 +418,10 @@ def _build_ai_prompt_packet_custom(target_lang: str, original_text_full: str, pr
 
 def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, is_retry: bool = False) -> dict:
     if not _has_meaningful_text(original_text_full):
+        _trace('ai.skip.no_text', {
+            'target_lang': target_lang,
+            'provider': ai.provider if ai else '',
+        })
         return {
             'aiTextFull': '',
             'meta': {
@@ -423,7 +446,7 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
     if base_url in ('', 'auto'):
         base_url = (preset.get('base_url') or '').strip()
 
-    if provider not in ('gemini', 'anthropic'):
+    if provider not in ('gemini', 'anthropic', 'cli_gemini', 'cli_codex'):
         if not base_url:
             base_url = (_resolve_provider_defaults('openai') or {}).get(
                 'base_url') or 'https://api.openai.com/v1'
@@ -434,7 +457,23 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
 
     started = _now()
     used_model = model
-    if provider == 'gemini':
+    _trace('ai.call.begin', {
+        'provider': provider,
+        'model': model,
+        'base_url': base_url,
+        'target_lang': target_lang,
+        'is_retry': is_retry,
+        'input_len': len(str(original_text_full or '')),
+        'system_len': len(system_text),
+        'user_parts': len(user_parts),
+    })
+    if provider == 'cli_gemini':
+        raw = core._cli_gemini_generate_json(system_text, user_parts)
+        used_model = 'gemini-cli'
+    elif provider == 'cli_codex':
+        raw = core._cli_codex_generate_json(system_text, user_parts)
+        used_model = 'codex-cli'
+    elif provider == 'gemini':
         raw = core._gemini_generate_json(
             api_key, model, system_text, user_parts)
     elif provider == 'anthropic':
@@ -452,6 +491,14 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         raw) if core.DO_AI_JSON else core._parse_ai_textfull_text_only(raw)
 
     ai_text_full = _sanitize_marked_text(ai_text_full)
+    _trace('ai.call.done', {
+        'provider': provider,
+        'used_model': used_model,
+        'raw_len': len(str(raw or '')),
+        'ai_text_len': len(ai_text_full),
+        'latency_sec': round(_now() - started, 3),
+        'preview': ai_text_full[:160],
+    })
 
     return {
         'aiTextFull': ai_text_full,
@@ -1023,11 +1070,33 @@ async def _worker_loop(worker_id: int):
     while True:
         jid, payload = await _job_queue.get()
         try:
+            _trace('job.running', {
+                'id': jid,
+                'worker': worker_id,
+                'mode': str(payload.get('mode') or ''),
+                'lang': str(payload.get('lang') or ''),
+                'source': str(payload.get('source') or ''),
+                'has_ai': isinstance(payload.get('ai'), dict),
+                'has_datauri': bool(payload.get('imageDataUri')),
+                'has_src': bool(payload.get('src')),
+            })
             _jobs[jid] = {'status': 'running', 'ts': _now()}
             result = await asyncio.to_thread(_process_payload, payload)
             _jobs[jid] = {'status': 'done', 'result': result, 'ts': _now()}
+            _trace('job.done', {
+                'id': jid,
+                'worker': worker_id,
+                'result_keys': list(result.keys()) if isinstance(result, dict) else [],
+                'has_ai_text': bool(isinstance(result, dict) and (result.get('AiTextFull') or (result.get('Ai') or {}).get('aiTextFull'))),
+                'perf': result.get('perf') if isinstance(result, dict) else None,
+            })
         except Exception as e:
             _jobs[jid] = {'status': 'error', 'result': str(e), 'ts': _now()}
+            _trace('job.error', {
+                'id': jid,
+                'worker': worker_id,
+                'error': str(e),
+            })
         finally:
             _job_queue.task_done()
 
@@ -1043,6 +1112,14 @@ def _process_payload(payload: dict) -> dict:
     src = (payload.get('src') or '').strip()
     img_bytes = b''
     mime = ''
+    _trace('payload.start', {
+        'mode': mode,
+        'lang': lang,
+        'source': str(payload.get('source') or ''),
+        'has_datauri': bool(payload.get('imageDataUri')),
+        'src_prefix': src[:80],
+        'page_url': page_url[:120],
+    })
 
     try:
         if payload.get('imageDataUri'):
@@ -1058,35 +1135,60 @@ def _process_payload(payload: dict) -> dict:
 
     if not img_bytes:
         raise Exception('[download] No image data')
+    _trace('payload.image.ready', {
+        'bytes': len(img_bytes),
+        'mime': mime,
+        'download_ms': round((t_img - t_all) * 1000, 1),
+    })
 
     ai_cfg = None
     ai = payload.get('ai') or None
     source = str(payload.get('source') or '').strip().lower() or 'translated'
-    if mode == 'lens_text' and source == 'ai' and isinstance(ai, dict):
-        api_key = str(ai.get('api_key') or '').strip() or (
-            os.getenv('AI_API_KEY') or '').strip()
-        ai_cfg = AiConfig(
-            api_key=api_key,
-            model=str(ai.get('model') or 'auto').strip() or 'auto',
-            provider=str(ai.get('provider') or 'auto').strip() or 'auto',
-            base_url=str(ai.get('base_url') or 'auto').strip() or 'auto',
-            prompt_editable=str(ai.get('prompt') or '').strip(),
-        )
+    is_ai_source = source == 'ai' or source.startswith('cli_')
+    if mode == 'lens_text' and is_ai_source:
+        if source.startswith('cli_'):
+            ai_cfg = AiConfig(
+                api_key=source,
+                model='auto',
+                provider=source,
+                base_url='auto',
+                prompt_editable=str(ai.get('prompt') if isinstance(ai, dict) else '')
+            )
+        elif isinstance(ai, dict):
+            api_key = str(ai.get('api_key') or '').strip() or (
+                os.getenv('AI_API_KEY') or '').strip()
+            ai_cfg = AiConfig(
+                api_key=api_key,
+                model=str(ai.get('model') or 'auto').strip() or 'auto',
+                provider=str(ai.get('provider') or 'auto').strip() or 'auto',
+                base_url=str(ai.get('base_url') or 'auto').strip() or 'auto',
+                prompt_editable=str(ai.get('prompt') or '').strip(),
+            )
+    _trace('payload.ai.config', {
+        'mode': mode,
+        'source': source,
+        'is_ai_source': is_ai_source,
+        'has_ai_cfg': ai_cfg is not None,
+        'provider': ai_cfg.provider if ai_cfg else '',
+        'model': ai_cfg.model if ai_cfg else '',
+        'prompt_len': len(ai_cfg.prompt_editable) if ai_cfg else 0,
+    })
 
     core.DO_AI_JSON = False
 
     img_hash = _sha256_hex(img_bytes)
     cache_key = ''
     if mode == 'lens_text' and img_hash:
-        cache_source = 'ai' if source == 'ai' else 'text'
+        cache_source = 'ai' if is_ai_source else 'text'
         cache_key = _build_cache_key(
             img_hash, lang, mode, cache_source, ai_cfg)
         cached = None
-        if source == 'ai':
+        if is_ai_source:
             cached = _lru_get(_ai_result_cache, _ai_cache_lock, cache_key)
         else:
             cached = _lru_get(_result_cache, _result_cache_lock, cache_key)
         if cached:
+            _trace('payload.cache.hit', {'source': source, 'cache_key_len': len(cache_key)})
             cached['perf'] = {
                 'cache': 'hit',
                 'total_ms': round((time.perf_counter() - t_all) * 1000, 1),
@@ -1099,6 +1201,12 @@ def _process_payload(payload: dict) -> dict:
         f.write(img_bytes)
         tmp_path = f.name
     t_tmp = time.perf_counter()
+    _trace('payload.process.begin', {
+        'tmp_suffix': suffix,
+        'source': source,
+        'mode': mode,
+        'lang': lang,
+    })
     try:
         try:
             out = process_image_path(tmp_path, lang, mode, ai_cfg)
@@ -1113,6 +1221,13 @@ def _process_payload(payload: dict) -> dict:
                 raise Exception(f'[ocr] {e}') from e
             else:
                 raise Exception(f'[render] {e}') from e
+        _trace('payload.process.done', {
+            'source': source,
+            'has_original_text': bool(isinstance(out, dict) and out.get('originalTextFull')),
+            'has_translated_text': bool(isinstance(out, dict) and out.get('translatedTextFull')),
+            'has_ai_text': bool(isinstance(out, dict) and (out.get('AiTextFull') or (out.get('Ai') or {}).get('aiTextFull'))),
+            'total_ms': round((time.perf_counter() - t_all) * 1000, 1),
+        })
         out['perf'] = {
             'cache': 'miss' if cache_key else 'off',
             'total_ms': round((time.perf_counter() - t_all) * 1000, 1),
@@ -1120,7 +1235,7 @@ def _process_payload(payload: dict) -> dict:
             'tmp_ms': round((t_tmp - t_img) * 1000, 1),
         }
         if cache_key and isinstance(out, dict):
-            if source == 'ai':
+            if is_ai_source:
                 _lru_set(_ai_result_cache, _ai_cache_lock,
                          cache_key, out, TP_AI_RESULT_CACHE_MAX)
             else:
@@ -1162,7 +1277,8 @@ async def meta():
     sources = [
         {'id': 'original', 'name': 'Original'},
         {'id': 'translated', 'name': 'Translated'},
-        {'id': 'ai', 'name': 'Ai'},
+        {'id': 'ai', 'name': 'Ai (API Key)'},
+        {'id': 'cli', 'name': 'CLI Tools'},
     ]
     env_key = (os.getenv('AI_API_KEY') or '').strip()
     return {'ok': True, 'languages': langs, 'sources': sources, 'has_env_ai_key': bool(env_key)}
@@ -1170,6 +1286,16 @@ async def meta():
 @app.post('/translate')
 async def translate(payload: Dict[str, Any]):
     jid = str(uuid.uuid4())
+    _trace('rest.enqueue', {
+        'id': jid,
+        'mode': str(payload.get('mode') or ''),
+        'lang': str(payload.get('lang') or ''),
+        'source': str(payload.get('source') or ''),
+        'ai_provider': str(((payload.get('ai') or {}) if isinstance(payload.get('ai'), dict) else {}).get('provider') or ''),
+        'ai_key_marker': str(((payload.get('ai') or {}) if isinstance(payload.get('ai'), dict) else {}).get('api_key') or '')[:40],
+        'has_datauri': bool(payload.get('imageDataUri')),
+        'has_src': bool(payload.get('src')),
+    })
     _dbg('rest.enqueue', {
         'id': jid,
         'mode': str(payload.get('mode') or ''),

@@ -67,6 +67,15 @@ function shouldPreferRest(base, mode, source) {
   }
 }
 
+function isAiLikeSource(source) {
+  const s = String(source || "").trim().toLowerCase();
+  return s === "ai" || s.startsWith("cli_");
+}
+
+function isCliSource(source) {
+  return String(source || "").trim().toLowerCase().startsWith("cli_");
+}
+
 function effectiveMaxConcurrency() {
   const soft =
     Number(softMaxConcurrency) > 0
@@ -86,6 +95,11 @@ function aiSoftMaxConcurrencyFromKey(key) {
   if (kl === "local" || kl === "ollama" || kl === "llama" || kl === "llama-server" || kl === "lmstudio" || kl === "localhost" || kl === "none" || kl === "dummy" || kl === "no-key" || kl.startsWith("local-") || kl.startsWith("local_")) return 5;
   if (k.startsWith("hf_")) return 3;
   return 10;
+}
+
+function softConcurrencyForSource(source, aiKey) {
+  if (isCliSource(source)) return 10;
+  return aiSoftMaxConcurrencyFromKey(aiKey);
 }
 
 function statusTextFor(code, fallback = "") {
@@ -746,6 +760,15 @@ async function readLimitedText(res, limit = 1600) {
 
 async function submitJobViaRest(base, payload) {
   const url = base.replace(/\/+$/, "") + "/translate";
+  ev("job.submit.rest.begin", {
+    mode: payload?.mode || "",
+    lang: payload?.lang || "",
+    source: payload?.source || "",
+    aiProvider: payload?.ai?.provider || "",
+    aiKeyMarker: String(payload?.ai?.api_key || "").slice(0, 40),
+    hasDataUri: Boolean(payload?.imageDataUri),
+    hasSrc: Boolean(payload?.src),
+  });
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -761,7 +784,11 @@ async function submitJobViaRest(base, payload) {
   }
   const data = await res.json();
   if (!data?.id) throw new Error("REST submit failed: no id");
-  ev("job.submit.rest", { id: data.id });
+  ev("job.submit.rest", {
+    id: data.id,
+    source: payload?.source || "",
+    aiProvider: payload?.ai?.provider || "",
+  });
   return data.id;
 }
 
@@ -834,6 +861,10 @@ async function pollJobViaRest(
       await handleResult(jid, data.result);
       return;
     } else if (st === "error") {
+      evWarn("job.poll.error", {
+        id: jid,
+        result: String(data?.result || data?.error || data?.message || "Unknown error").slice(0, 1000),
+      });
       handleJobError(
         jid,
         String(data?.result || data?.error || data?.message || "Unknown error"),
@@ -1582,8 +1613,7 @@ async function processJob(payload, tabId, frameId = 0) {
     !payload?.imageDataUri &&
     Boolean(src) &&
     (/^(?:https?:|blob:|data:|file:|chrome-extension:)/i.test(src) ||
-      (payload?.mode === "lens_text" &&
-        String(payload?.source || "").toLowerCase() === "ai"));
+      (payload?.mode === "lens_text" && isAiLikeSource(payload?.source)));
   if (shouldPrefetchDataUri) {
     const key = normImgSrc(src);
     pruneMdDataUriCache();
@@ -1692,7 +1722,7 @@ async function processJob(payload, tabId, frameId = 0) {
         keepCacheOnStale: isMd,
         settingsEpoch,
       });
-      await pollJobViaRest(base, jid, { timeoutMs: payload?.source === "ai" ? REST_POLL_TIMEOUT_AI_MS : REST_POLL_TIMEOUT_MS });
+      await pollJobViaRest(base, jid, { timeoutMs: isAiLikeSource(payload?.source) ? REST_POLL_TIMEOUT_AI_MS : REST_POLL_TIMEOUT_MS });
       return;
     } catch (e) {
       const msg = e?.message || String(e);
@@ -1746,7 +1776,7 @@ async function processJob(payload, tabId, frameId = 0) {
               keepCacheOnStale: isMd,
               settingsEpoch,
             });
-            await pollJobViaRest(base, jid, { timeoutMs: payload?.source === "ai" ? REST_POLL_TIMEOUT_AI_MS : REST_POLL_TIMEOUT_MS });
+            await pollJobViaRest(base, jid, { timeoutMs: isAiLikeSource(payload?.source) ? REST_POLL_TIMEOUT_AI_MS : REST_POLL_TIMEOUT_MS });
             return;
           } catch (e) {
             const msg = e?.message || String(e);
@@ -1863,6 +1893,7 @@ async function getSettings() {
         "aiBaseUrl",
         "aiPromptByLang",
         "aiPrompt",
+        "cliTool",
       ],
       (it) => {
         MAX_CONCURRENCY =
@@ -1911,6 +1942,7 @@ async function getSettings() {
           aiModel,
           aiBaseUrl: typeof it.aiBaseUrl === "string" ? it.aiBaseUrl : "",
           aiPrompt,
+          cliTool: typeof it.cliTool === "string" ? it.cliTool : "cli_gemini",
         });
       },
     );
@@ -1924,22 +1956,42 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
     const tabSessionId = tab?.id
       ? ensureTabSession(tab.id, tab?.url || "")
       : "";
-    const { mode, lang, sources, aiKey, aiModel, aiBaseUrl, aiPrompt } =
+    const { mode, lang, sources, aiKey, aiModel, aiBaseUrl, aiPrompt, cliTool } =
       await getSettings();
-    const source =
+    let source =
       mode === "lens_text" ? sources || "translated" : "translated";
-    const aiPayload =
-      mode === "lens_text" && source === "ai"
-        ? {
-            api_key: aiKey || "",
-            model: aiModel || "auto",
-            base_url: aiBaseUrl || "auto",
-            prompt: aiPrompt || "",
-          }
-        : null;
-    forceSoftMaxConcurrency = mode === "lens_text" && source === "ai";
+    let aiPayload = null;
+    if (mode === "lens_text") {
+      if (source === "ai") {
+        aiPayload = {
+          api_key: aiKey || "",
+          model: aiModel || "auto",
+          base_url: aiBaseUrl || "auto",
+          prompt: aiPrompt || "",
+        };
+      } else if (source === "cli") {
+        source = cliTool || "cli_gemini";
+        aiPayload = {
+          api_key: cliTool || "cli_gemini",
+          model: "auto",
+          provider: cliTool || "cli_gemini",
+          base_url: "auto",
+          prompt: aiPrompt || "",
+        };
+      }
+    }
+    ev("menu.settings.resolved", {
+      mode,
+      lang,
+      storedSource: sources || "",
+      effectiveSource: source,
+      cliTool: cliTool || "",
+      hasAiPayload: Boolean(aiPayload),
+      aiProvider: aiPayload?.provider || "",
+    });
+    forceSoftMaxConcurrency = mode === "lens_text" && isAiLikeSource(source);
     softMaxConcurrency = forceSoftMaxConcurrency
-      ? aiSoftMaxConcurrencyFromKey(aiKey)
+      ? softConcurrencyForSource(source, aiKey)
       : SOFT_MAX_CONCURRENCY_DEFAULT;
     ev("batch.concurrency", {
       soft: softMaxConcurrency,

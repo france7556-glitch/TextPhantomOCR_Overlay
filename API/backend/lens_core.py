@@ -59,6 +59,9 @@ DRAW_OUTLINE_PARA = False
 DRAW_OUTLINE_ITEM = False
 AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "4"))
 _ai_semaphore = threading.Semaphore(AI_MAX_CONCURRENCY)
+CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "10")))
+CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "120")))
+_cli_semaphore = threading.Semaphore(CLI_MAX_CONCURRENCY)
 
 DRAW_OUTLINE_SPAN = False
 PARA_OUTLINE = (0, 0, 255, 255)
@@ -383,6 +386,14 @@ AI_PROVIDER_DEFAULTS = {
         "model": "auto",
         "base_url": "http://127.0.0.1:8080/v1",
     },
+    "cli_gemini": {
+        "model": "gemini-cli",
+        "base_url": "",
+    },
+    "cli_codex": {
+        "model": "codex-cli",
+        "base_url": "",
+    },
 }
 
 AI_PROVIDER_ALIASES = {
@@ -401,6 +412,8 @@ AI_PROVIDER_ALIASES = {
     "llama-server": "local",
     "llama_server": "local",
     "localhost": "local",
+    "cli-gemini": "cli_gemini",
+    "cli-codex": "cli_codex",
 }
 
 AI_MODEL_ALIASES = {
@@ -419,6 +432,7 @@ AI_MODEL_ALIASES = {
 
 AI_PROMPT_SYSTEM_BASE = (
     "You are a professional manga translator and dialogue localizer.\n"
+    "The input text is extracted via OCR and may contain errors, typos, or fragmented sentences. Please infer the correct context.\n"
     "Rewrite each paragraph as natural dialogue in the target language while preserving meaning, tone, intent, and character voice.\n"
     "Keep lines concise for speech bubbles. Do not add new information. Do not omit meaning. Do not explain.\n"
     "Preserve emphasis (… ! ?). Avoid excessive punctuation.\n"
@@ -427,16 +441,13 @@ AI_PROMPT_SYSTEM_BASE = (
 
 AI_LANG_STYLE = {
     "th": (
-        "Target language: Thai\\n"
-        "Write Thai manga dialogue that reads like a high-quality Thai scanlation: natural, concise, and in-character.\\n"
-        "Keep lines short for speech bubbles; avoid stiff, literal phrasing.\\n"
-        "Default: omit pronouns and omit gendered polite sentence-final particles unless the source line clearly requires them.\\n"
-        "Never use the word 'ฉัน'. Prefer omitting the subject.\\n"
-        "Never use a male-coded second-person pronoun. When addressing someone by name, do not add a second-person pronoun after the name; prefer NAME + clause.\\n"
-        "If a second-person reference is unavoidable, use a neutral/casual form appropriate to tone, but keep it gender-neutral and consistent with the line.\\n"
-        "Use particles/interjections sparingly to match tone; do not overuse.\\n"
-        "Keep names/terms consistent; transliterate when appropriate.\\n"
-        "Output only the translated text."
+        "Target language: Thai\n"
+        "You are translating raw text extracted from images (OCR). The input might contain typos, missed characters, or strange line breaks. Infer the correct meaning based on context.\n"
+        "Write Thai manga/comic dialogue that reads like a high-quality scanlation: natural, conversational, and in-character.\n"
+        "Keep lines concise and fit for speech bubbles. Avoid stiff or overly literal, machine-like translations.\n"
+        "Pronouns: Omit pronouns (like ฉัน, ผม, เธอ, นาย) and polite particles (ครับ, ค่ะ) unless absolutely necessary for the tone or relationship between characters.\n"
+        "Do not over-explain or add notes. Transliterate names naturally.\n"
+        "Output ONLY the translated text."
     ),
     "en": (
         "Target language: English\n"
@@ -458,7 +469,9 @@ AI_LANG_STYLE = {
         "Keep names and recurring terms consistent; avoid over-explaining."
     ),
     "default": (
-        "Write natural manga dialogue in the target language: concise, spoken, faithful to meaning and tone."
+        "You are translating raw text extracted from images (OCR). The input might contain errors. Infer the correct context.\n"
+        "Write natural manga dialogue in the target language: concise, spoken, faithful to meaning and tone.\n"
+        "Output ONLY the translated text."
     ),
 }
 
@@ -683,6 +696,231 @@ def _gemini_generate_json(api_key: str, model: str, system_text: str, user_parts
         raise Exception("Gemini returned empty text")
     return txt
 
+def _cli_gemini_generate_json(system_text: str, user_parts: list[str]) -> str:
+    import subprocess, shutil
+    text_parts = []
+    for p in user_parts:
+        if (p or "").strip():
+            text_parts.append(p.strip())
+    target = _infer_cli_target_language(system_text)
+    rules_text = re.sub(r"\s+", " ", str(system_text or "").strip())
+    ocr_text = "\n\n".join(text_parts)
+    ocr_text = re.sub(r"(?i)^\s*Input\s*:\s*", "", ocr_text.strip())
+    ocr_text = re.sub(r"\s+", " ", ocr_text).strip()
+    full_prompt = (
+        f"TASK: Translate this exact OCR text to {target}. Return only translated text. "
+        "Preserve all paragraph markers like <<TP_P0>> unchanged and in order. "
+        f"RULES: {rules_text} OCR_TEXT: {ocr_text}"
+    )
+    
+    exe = shutil.which("gemini")
+    if not exe:
+        print("[TextPhantom][trace] cli.gemini.not_found", flush=True)
+        raise Exception("Gemini CLI not found. Please install it globally (npm install -g @google/gemini-cli).")
+    if os.name == "nt" and exe.lower().endswith(".cmd"):
+        ps1 = exe[:-4] + ".ps1"
+        if os.path.exists(ps1):
+            exe = ps1
+        
+    timeout_sec = float(CLI_TIMEOUT_SEC)
+    cmd = [exe, full_prompt]
+    print(
+        f"[TextPhantom][trace] cli.gemini.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
+        flush=True,
+    )
+    started = time.time()
+    try:
+        with _cli_semaphore:
+            wait_dt = time.time() - started
+            print(
+                f"[TextPhantom][trace] cli.gemini.begin wait={wait_dt:.1f}s",
+                flush=True,
+            )
+            run_started = time.time()
+            result = _run_cli_subprocess(cmd, timeout_sec, "gemini")
+        dt = time.time() - run_started
+        print(
+            f"[TextPhantom][trace] cli.gemini.end code={result.returncode} dt={dt:.1f}s stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
+            flush=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            out = (result.stdout or "").strip()
+            detail = err or out or "no output"
+            raise Exception(f"Gemini CLI error (Code {result.returncode}): {detail[:500]}")
+        txt = (result.stdout or "").strip()
+        if not txt:
+            err = (result.stderr or "").strip()
+            raise Exception(f"Gemini CLI returned empty output{': ' + err[:500] if err else ''}")
+        return txt
+    except subprocess.TimeoutExpired:
+        print(f"[TextPhantom][trace] cli.gemini.timeout timeout={timeout_sec:.0f}s", flush=True)
+        raise Exception(f"Gemini CLI request timed out ({timeout_sec:.0f}s)")
+    except Exception as e:
+        raise Exception(f"Gemini CLI execution failed: {str(e)}")
+
+def _cli_codex_generate_json(system_text: str, user_parts: list[str]) -> str:
+    import subprocess, shutil
+    prompt_parts = [system_text]
+    for p in user_parts:
+        if (p or "").strip():
+            prompt_parts.append(p.strip())
+    full_prompt = "\n\n".join(prompt_parts)
+    
+    exe = shutil.which("codex")
+    if not exe:
+        print("[TextPhantom][trace] cli.codex.not_found", flush=True)
+        raise Exception("Codex CLI not found. Please install it globally.")
+        
+    timeout_sec = float(CLI_TIMEOUT_SEC)
+    cmd = [exe, "exec", full_prompt]
+    print(
+        f"[TextPhantom][trace] cli.codex.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
+        flush=True,
+    )
+    started = time.time()
+    try:
+        with _cli_semaphore:
+            wait_dt = time.time() - started
+            print(
+                f"[TextPhantom][trace] cli.codex.begin wait={wait_dt:.1f}s",
+                flush=True,
+            )
+            run_started = time.time()
+            result = _run_cli_subprocess(cmd, timeout_sec, "codex")
+        dt = time.time() - run_started
+        print(
+            f"[TextPhantom][trace] cli.codex.end code={result.returncode} dt={dt:.1f}s stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
+            flush=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            out = (result.stdout or "").strip()
+            detail = err or out or "no output"
+            raise Exception(f"Codex CLI error (Code {result.returncode}): {detail[:500]}")
+        txt = (result.stdout or "").strip()
+        if not txt:
+            err = (result.stderr or "").strip()
+            raise Exception(f"Codex CLI returned empty output{': ' + err[:500] if err else ''}")
+        return txt
+    except subprocess.TimeoutExpired:
+        print(f"[TextPhantom][trace] cli.codex.timeout timeout={timeout_sec:.0f}s", flush=True)
+        raise Exception(f"Codex CLI request timed out ({timeout_sec:.0f}s)")
+    except Exception as e:
+        raise Exception(f"Codex CLI execution failed: {str(e)}")
+
+def _infer_cli_target_language(system_text: str) -> str:
+    s = str(system_text or "")
+    m = re.search(r"(?im)^\s*Target\s+language\s*:\s*([^\n\r]+)", s)
+    if m:
+        return m.group(1).strip() or "the target language specified in the rules"
+    return "the target language specified in the rules"
+
+def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
+    import subprocess, shutil
+
+    class _CliResult:
+        def __init__(self, returncode: int, stdout: str, stderr: str):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    cwd = os.path.expanduser("~") or None
+    env = os.environ.copy()
+    env.setdefault("NO_COLOR", "1")
+    run_cmd = cmd
+    stdin_mode = subprocess.PIPE
+    if tool_name == "gemini":
+        # Gemini CLI relaunches itself unless these are set. In a Python
+        # subprocess that relaunch path can hang or fail with spawn EPERM.
+        env["GEMINI_CLI_NO_RELAUNCH"] = "true"
+        env["SANDBOX"] = "1"
+        node_exe = shutil.which("node") or "node"
+        gemini_dir = os.path.dirname(cmd[0])
+        gemini_js = os.path.join(
+            gemini_dir, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"
+        )
+        if os.path.exists(gemini_js):
+            run_cmd = [
+                node_exe,
+                gemini_js,
+                "-p",
+                cmd[1] if len(cmd) > 1 else "",
+                "--output-format",
+                "text",
+                "--approval-mode",
+                "plan",
+                "--allowed-tools",
+                "none",
+            ]
+        else:
+            run_cmd = [
+                cmd[0],
+                "-p",
+                cmd[1] if len(cmd) > 1 else "",
+                "--output-format",
+                "text",
+                "--approval-mode",
+                "plan",
+                "--allowed-tools",
+                "none",
+            ]
+        stdin_mode = None
+        print(
+            f"[TextPhantom][trace] cli.gemini.env no_relaunch=true sandbox=1 node={node_exe!r}",
+            flush=True,
+        )
+
+    proc = subprocess.Popen(
+        run_cmd,
+        stdin=stdin_mode,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=env,
+    )
+    print(
+        f"[TextPhantom][trace] cli.{tool_name}.spawn pid={proc.pid} cwd={cwd!r}",
+        flush=True,
+    )
+    try:
+        if stdin_mode == subprocess.PIPE:
+            stdout, stderr = proc.communicate(input="", timeout=timeout_sec)
+        else:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
+        return _CliResult(proc.returncode, stdout or "", stderr or "")
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except Exception:
+            stdout, stderr = "", ""
+        raise subprocess.TimeoutExpired(cmd, timeout_sec, output=stdout, stderr=stderr)
+
+def _kill_process_tree(pid: int) -> None:
+    if not pid:
+        return
+    try:
+        import subprocess
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        else:
+            import signal
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
 def _read_first_env(*names: str) -> str:
     for n in names:
         v = (os.environ.get(n) or "").strip()
@@ -693,6 +931,10 @@ def _read_first_env(*names: str) -> str:
 def _detect_ai_provider_from_key(api_key: str) -> str:
     k = (api_key or "").strip()
     kl = k.lower()
+    if kl in ("cli-gemini", "cli_gemini"):
+        return "cli_gemini"
+    if kl in ("cli-codex", "cli_codex"):
+        return "cli_codex"
     if kl in ("local", "ollama", "lmstudio", "llama", "llama-server", "localhost", "none", "dummy", "no-key"):
         return "local"
     if kl.startswith("local-") or kl.startswith("local_"):
@@ -738,7 +980,7 @@ def _resolve_ai_config():
     if base_url in ("", "auto"):
         base_url = (preset.get("base_url") or "").strip()
 
-    if provider not in ("gemini", "anthropic"):
+    if provider not in ("gemini", "anthropic", "cli_gemini", "cli_codex"):
         if not base_url:
             base_url = (AI_PROVIDER_DEFAULTS.get("openai") or {}).get(
                 "base_url") or "https://api.openai.com/v1"

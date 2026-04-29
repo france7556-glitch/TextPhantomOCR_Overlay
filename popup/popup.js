@@ -144,6 +144,8 @@ const langSel = document.getElementById("lang");
 const sourcesSel = document.getElementById("sources");
 const langWrap = document.getElementById("lang-wrap");
 const sourcesWrap = document.getElementById("sources-wrap");
+const cliToolWrap = document.getElementById("cli-tool-wrap");
+const cliToolSel = document.getElementById("cli-tool");
 const aiKeyWrap = document.getElementById("ai-key-wrap");
 const aiKeyInput = document.getElementById("ai-key");
 const aiBaseUrlWrap = document.getElementById("ai-baseurl-wrap");
@@ -186,6 +188,7 @@ let lastResolvedKey = "";
 
 let desiredLang = "en";
 let desiredSources = "translated";
+let desiredCliTool = "cli_gemini";
 let desiredAiModel = "auto";
 let desiredAiBaseUrl = "";
 
@@ -481,17 +484,22 @@ function toggleUi() {
   const needLang = MODES.find((m) => m.id === modeId)?.needLang ?? true;
   const showLang = needLang && !(isText && source === "original");
   langWrap.style.display = showLang ? "" : "none";
-  const showAi = isText && source === "ai";
+  
+  const isAiSource = source === "ai" || source === "cli";
+  const isCliSource = source === "cli";
+  const showAi = isText && isAiSource;
+
+  cliToolWrap.style.display = isCliSource ? "" : "none";
 
   const hasEnv = Boolean(metaCache?.has_env_ai_key);
   const hasKey = (aiKeyInput.value || "").trim().length > 0;
-  const canConfigureAi = hasKey || hasEnv;
+  const canConfigureAi = (hasKey || hasEnv) && !isCliSource;
   const showBaseUrl = showAi && canConfigureAi && isLocalAiKey(aiKeyInput.value);
 
-  aiKeyWrap.style.display = showAi ? "" : "none";
+  aiKeyWrap.style.display = (showAi && !isCliSource) ? "" : "none";
   if (aiBaseUrlWrap) aiBaseUrlWrap.style.display = showBaseUrl ? "" : "none";
-  aiModelWrap.style.display = showAi && canConfigureAi ? "" : "none";
-  aiPromptWrap.style.display = showAi && canConfigureAi ? "" : "none";
+  aiModelWrap.style.display = (showAi && canConfigureAi) ? "" : "none";
+  aiPromptWrap.style.display = showAi && (canConfigureAi || isCliSource) ? "" : "none";
 }
 
 async function refreshMeta(baseUrl) {
@@ -523,6 +531,7 @@ async function refreshMeta(baseUrl) {
 
       const afterLang = langSel.value;
       const afterSources = sourcesSel.value;
+      const afterCliTool = cliToolSel?.value;
       const patch = {};
       if (afterLang && afterLang !== desiredLang) {
         desiredLang = afterLang;
@@ -531,6 +540,10 @@ async function refreshMeta(baseUrl) {
       if (afterSources && afterSources !== desiredSources) {
         desiredSources = afterSources;
         patch.sources = afterSources;
+      }
+      if (afterCliTool && afterCliTool !== desiredCliTool) {
+        desiredCliTool = afterCliTool;
+        patch.cliTool = afterCliTool;
       }
       if (Object.keys(patch).length) await chrome.storage.local.set(patch);
       toggleUi();
@@ -543,7 +556,8 @@ async function ensureAiAvailableOrFallback() {
   if (modeId !== "lens_text") return true;
 
   const source = (sourcesSel.value || "").trim() || "translated";
-  if (source !== "ai") return true;
+  if (source !== "ai" && source !== "cli") return true;
+  if (source === "cli") return true;
 
   const hasEnv = Boolean(metaCache?.has_env_ai_key);
   const hasKey = (aiKeyInput.value || "").trim().length > 0;
@@ -591,9 +605,18 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
   if (!base) return;
 
   const source = (sourcesSel.value || "").trim() || "translated";
-  if (source !== "ai") {
+  if (source !== "ai" && source !== "cli") {
     setModelOptions([], { keepValue: "auto" });
     setAiKeyStatus("none");
+    return;
+  }
+
+  if (source === "cli") {
+    const providerLabel = cliToolSel.value === "cli_gemini" ? "Gemini CLI" : "Codex CLI";
+    setAiKeyStatus("ok", `✓ ${providerLabel} ready`);
+    setModelOptions([], { keepValue: "auto" });
+    if (forcePrompt) await applyPromptForLang(langSel.value, { forceFetch: true });
+    toggleUi();
     return;
   }
 
@@ -749,7 +772,7 @@ function canUseAiUi() {
   const modeId = modeSel.value || "lens_text";
   if (modeId !== "lens_text") return false;
   const source = (sourcesSel.value || "").trim() || "translated";
-  return source === "ai";
+  return source === "ai" || source === "cli";
 }
 
 async function fetchDefaultPromptForLang(lang, model = 'auto') {
@@ -952,6 +975,7 @@ async function loadSettings() {
     "aiModel",
     "aiBaseUrl",
     "aiPromptByLang",
+    "cliTool",
   ]);
 
   modeSel.value = stored.mode || "lens_text";
@@ -965,6 +989,10 @@ async function loadSettings() {
     typeof stored.aiModel === "string" && stored.aiModel
       ? stored.aiModel
       : "auto";
+  desiredCliTool =
+    typeof stored.cliTool === "string" && stored.cliTool
+      ? stored.cliTool
+      : "cli_gemini";
 
   setSelectOptions(langSel, FALLBACK_LANGS, {
     valueKey: "code",
@@ -979,6 +1007,7 @@ async function loadSettings() {
 
   langSel.value = desiredLang;
   sourcesSel.value = desiredSources;
+  cliToolSel.value = desiredCliTool;
 
   const storedCustom = String(stored.customApiUrl || "");
   lastSavedApiUrl = storedCustom;
@@ -1129,6 +1158,14 @@ sourcesSel.addEventListener("change", async () => {
   await chrome.storage.local.set({ sources: desiredSources });
   toggleUi();
   if (ok) await applyPromptForLang(desiredLang, { forceFetch: false });
+  refreshAiMeta({ forcePrompt: false });
+  chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
+});
+
+cliToolSel.addEventListener("change", async () => {
+  desiredCliTool = cliToolSel.value || desiredCliTool;
+  await chrome.storage.local.set({ cliTool: desiredCliTool });
+  toggleUi();
   refreshAiMeta({ forcePrompt: false });
   chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
 });
