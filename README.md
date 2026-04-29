@@ -102,3 +102,53 @@ When creating your Hugging Face API key, make sure the following permissions are
   <br><br>
   <img src="https://github.com/user-attachments/assets/92427293-8ec7-40c3-b797-a2b27fedb8a6" width="100%" alt="Example 3" />
 </p>
+
+---
+
+## 🛠️ คู่มือการรันโปรเจคด้วยตัวเอง (Local Setup Guide)
+
+สำหรับผู้ที่ดาวน์โหลด Source Code ไป และต้องการรันทั้ง API และ Extension ในเครื่องตัวเอง ให้ทำตามขั้นตอนดังนี้:
+
+### 1. การติดตั้งและรัน API (Python)
+ส่วนนี้คือหัวใจหลักในการประมวลผล OCR และการแปลภาษา
+
+**สิ่งที่ต้องมี:**
+- [Python 3.9 ขึ้นไป](https://www.python.org/downloads/)
+
+**ขั้นตอนการติดตั้ง:**
+1. เปิด Terminal หรือ Command Prompt แล้วเข้าไปที่โฟลเดอร์ `API` ของโปรเจค:
+   ```bash
+   cd API
+   ```
+2. ติดตั้ง Library ที่จำเป็น:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. เริ่มการทำงานของ API Server:
+   ```bash
+   uvicorn backend.server:app --host 0.0.0.0 --port 8000
+   ```
+   *เมื่อรันสำเร็จ คุณจะเห็นข้อความว่า `Uvicorn running on http://0.0.0.0:8000`*
+
+---
+
+### 2. การติดตั้ง Extension ใน Chrome
+1. เปิด Google Chrome แล้วไปที่ URL: `chrome://extensions/`
+2. เปิดโหมดนักพัฒนา (**Developer mode**) ที่มุมขวาบน
+3. คลิกปุ่ม **Load unpacked** (โหลดส่วนขยายที่คลายแพ็กแล้ว)
+4. เลือกโฟลเดอร์หลักของโปรเจค (โฟลเดอร์ที่มีไฟล์ `manifest.json`)
+
+---
+
+### 3. การเชื่อมต่อ Extension เข้ากับ Local API
+1. คลิกที่ไอคอนของ **TextPhantom** ในแถบเครื่องมือของ Chrome
+2. คลิกปุ่มฟันเฟือง (**Settings**)
+3. ในช่อง **Custom API URL** ให้กรอก:
+   ```text
+   http://localhost:8000
+   ```
+4. กดปุ่ม **Save** (หรือรอให้มันบันทึกอัตโนมัติ)
+5. **ทดสอบการใช้งาน:** คลิกขวาที่รูปภาพใดก็ได้บนเว็บไซต์ แล้วเลือก `🔍 Translate this image`
+
+---
+
