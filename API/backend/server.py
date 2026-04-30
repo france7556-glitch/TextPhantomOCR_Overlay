@@ -319,6 +319,7 @@ class AiConfig:
     provider: str = 'auto'
     base_url: str = 'auto'
     prompt_editable: str = ''
+    reasoning_effort: str = 'medium'
 
 def _collapse_ws(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
@@ -468,11 +469,11 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         'user_parts': len(user_parts),
     })
     if provider == 'cli_gemini':
-        raw = core._cli_gemini_generate_json(system_text, user_parts)
-        used_model = 'gemini-cli'
+        raw = core._cli_gemini_generate_json(system_text, user_parts, model)
+        used_model = model
     elif provider == 'cli_codex':
-        raw = core._cli_codex_generate_json(system_text, user_parts)
-        used_model = 'codex-cli'
+        raw = core._cli_codex_generate_json(system_text, user_parts, model, ai.reasoning_effort)
+        used_model = model
     elif provider == 'gemini':
         raw = core._gemini_generate_json(
             api_key, model, system_text, user_parts)
@@ -1149,10 +1150,11 @@ def _process_payload(payload: dict) -> dict:
         if source.startswith('cli_'):
             ai_cfg = AiConfig(
                 api_key=source,
-                model='auto',
+                model=str(ai.get('model') if isinstance(ai, dict) else 'auto').strip() or 'auto',
                 provider=source,
                 base_url='auto',
-                prompt_editable=str(ai.get('prompt') if isinstance(ai, dict) else '')
+                prompt_editable=str(ai.get('prompt') if isinstance(ai, dict) else ''),
+                reasoning_effort=str(ai.get('reasoning_effort') if isinstance(ai, dict) else 'medium').strip() or 'medium',
             )
         elif isinstance(ai, dict):
             api_key = str(ai.get('api_key') or '').strip() or (
@@ -1163,6 +1165,7 @@ def _process_payload(payload: dict) -> dict:
                 provider=str(ai.get('provider') or 'auto').strip() or 'auto',
                 base_url=str(ai.get('base_url') or 'auto').strip() or 'auto',
                 prompt_editable=str(ai.get('prompt') or '').strip(),
+                reasoning_effort=str(ai.get('reasoning_effort') or 'medium').strip() or 'medium',
             )
     _trace('payload.ai.config', {
         'mode': mode,
@@ -1214,6 +1217,8 @@ def _process_payload(payload: dict) -> dict:
             err_str = str(e).lower()
             if any(kw in err_str for kw in ('ai ', 'ai_', 'openai', 'gemini', 'anthropic', 'api_key', 'api key',
                                              'rate limit', 'ratelimit', '429', 'quota',
+                                             'usage limit', 'resource exhausted', 'daily limit', 'limit reached',
+                                             'codex cli', 'gemini cli',
                                              'model', 'generate', 'chat/completions')):
                 raise Exception(f'[ai] {e}') from e
             elif any(kw in err_str for kw in ('cannot identify image', 'image file is truncated',
@@ -1317,10 +1322,44 @@ async def translate_status(job_id: str):
 
 @app.post('/ai/resolve')
 async def ai_resolve(payload: Dict[str, Any]):
+    requested_provider = core._canonical_provider(str(payload.get('provider') or 'auto'))
     api_key = str(payload.get('api_key') or '').strip() or (
         os.getenv('AI_API_KEY') or '').strip()
     lang = _normalize_lang(str(payload.get('lang') or 'en'))
     style_default = ((getattr(core, 'AI_LANG_STYLE', {}) or {}).get(lang) or (getattr(core, 'AI_LANG_STYLE', {}) or {}).get('default') or '').strip()
+    if requested_provider == 'cli_gemini':
+        requested_model = str(payload.get('model') or 'auto').strip() or 'auto'
+        resolved_model = _resolve_model('cli_gemini', requested_model)
+        models = list(getattr(core, 'CLI_GEMINI_MODELS', ['auto']))
+        if resolved_model not in models:
+            models.append(resolved_model)
+        return {
+            'ok': True,
+            'provider': 'cli_gemini',
+            'base_url': '',
+            'default_model': 'auto',
+            'model': resolved_model,
+            'models': models,
+            'reasoning_effort': str(payload.get('reasoning_effort') or 'medium').strip() or 'medium',
+            'lang': lang,
+            'prompt_editable_default': style_default,
+        }
+    if requested_provider == 'cli_codex':
+        requested_model = str(payload.get('model') or 'auto').strip() or 'auto'
+        resolved_model = _resolve_model('cli_codex', requested_model)
+        models = list(getattr(core, 'CLI_CODEX_MODELS', ['auto']))
+        if resolved_model not in models:
+            models.append(resolved_model)
+        return {
+            'ok': True,
+            'provider': 'cli_codex',
+            'base_url': '',
+            'default_model': 'auto',
+            'model': resolved_model,
+            'models': models,
+            'lang': lang,
+            'prompt_editable_default': style_default,
+        }
     if not api_key:
         return {
             'ok': False,
@@ -1333,7 +1372,7 @@ async def ai_resolve(payload: Dict[str, Any]):
             'prompt_editable_default': style_default,
         }
 
-    provider = core._canonical_provider(str(payload.get('provider') or 'auto'))
+    provider = requested_provider
     if provider in ('', 'auto'):
         provider = _detect_provider_from_key(api_key)
 

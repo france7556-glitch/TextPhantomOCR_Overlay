@@ -38,6 +38,11 @@ const WARMUP_TTL_MS = 20 * 60 * 1000;
 const SOFT_MAX_CONCURRENCY_DEFAULT = 15;
 
 let MAX_CONCURRENCY = 10;
+
+function normalizeCodexEffort(effort) {
+  const e = String(effort || "").trim().toLowerCase();
+  return ["low", "medium", "high", "xhigh"].includes(e) ? e : "medium";
+}
 let softMaxConcurrency = SOFT_MAX_CONCURRENCY_DEFAULT;
 let forceSoftMaxConcurrency = false;
 let ws = null;
@@ -673,6 +678,18 @@ function classifyJobError(msg) {
     return { permanent: false, userMsg: `${stageLabel}เซิร์ฟเวอร์ AI ขัดข้อง (500)`, stage };
   if (m.includes("โควต้า ai หมด") || m.includes("quota") || m.includes("insufficient") || m.includes("payment required") || m.includes("402"))
     return { permanent: true, userMsg: `[ai] โควต้าหมด (402)`, stage: "ai" };
+  if (
+    m.includes("you've hit your usage limit") ||
+    m.includes("you have hit your usage limit") ||
+    m.includes("usage limit") ||
+    m.includes("quota exceeded") ||
+    m.includes("resource exhausted") ||
+    m.includes("daily limit") ||
+    m.includes("limit reached") ||
+    m.includes("codex cli usage limit") ||
+    m.includes("gemini cli usage limit")
+  )
+    return { permanent: true, userMsg: `[ai] CLI/AI usage limit reached`, stage: "ai" };
   if (m.includes("rest submit failed"))
     return { permanent: false, userMsg: `[api] ส่งงานล้มเหลว`, stage: "api" };
   if (m.includes("rest poll failed"))
@@ -1358,6 +1375,14 @@ function handleJobError(jobId, errMsg = "Unknown error") {
       { type: "IMAGE_ERROR", original: ctx.imgUrl, message: displayMsg },
       ctx.frameId || 0,
     );
+    if (userMsg) {
+      sendToastToTab(
+        ctx.tabId,
+        ctx.frameId || 0,
+        `TextPhantom: ${userMsg}`,
+        cls?.permanent ? 4200 : 2600,
+      );
+    }
   }
 
   pendingByJob.delete(jobId);
@@ -1894,6 +1919,7 @@ async function getSettings() {
         "aiPromptByLang",
         "aiPrompt",
         "cliTool",
+        "codexEffort",
       ],
       (it) => {
         MAX_CONCURRENCY =
@@ -1943,6 +1969,7 @@ async function getSettings() {
           aiBaseUrl: typeof it.aiBaseUrl === "string" ? it.aiBaseUrl : "",
           aiPrompt,
           cliTool: typeof it.cliTool === "string" ? it.cliTool : "cli_gemini",
+          codexEffort: normalizeCodexEffort(it.codexEffort),
         });
       },
     );
@@ -1956,7 +1983,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
     const tabSessionId = tab?.id
       ? ensureTabSession(tab.id, tab?.url || "")
       : "";
-    const { mode, lang, sources, aiKey, aiModel, aiBaseUrl, aiPrompt, cliTool } =
+    const { mode, lang, sources, aiKey, aiModel, aiBaseUrl, aiPrompt, cliTool, codexEffort } =
       await getSettings();
     let source =
       mode === "lens_text" ? sources || "translated" : "translated";
@@ -1967,15 +1994,17 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
           api_key: aiKey || "",
           model: aiModel || "auto",
           base_url: aiBaseUrl || "auto",
+          reasoning_effort: codexEffort || "medium",
           prompt: aiPrompt || "",
         };
       } else if (source === "cli") {
         source = cliTool || "cli_gemini";
         aiPayload = {
           api_key: cliTool || "cli_gemini",
-          model: "auto",
+          model: aiModel || "auto",
           provider: cliTool || "cli_gemini",
           base_url: "auto",
+          reasoning_effort: codexEffort || "medium",
           prompt: aiPrompt || "",
         };
       }

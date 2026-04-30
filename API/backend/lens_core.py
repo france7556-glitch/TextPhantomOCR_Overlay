@@ -387,11 +387,11 @@ AI_PROVIDER_DEFAULTS = {
         "base_url": "http://127.0.0.1:8080/v1",
     },
     "cli_gemini": {
-        "model": "gemini-cli",
+        "model": "auto",
         "base_url": "",
     },
     "cli_codex": {
-        "model": "codex-cli",
+        "model": "auto",
         "base_url": "",
     },
 }
@@ -429,6 +429,28 @@ AI_MODEL_ALIASES = {
         "gemma-3": "gemma-3-27b-it",
     }
 }
+
+CLI_GEMINI_MODELS = [
+    "auto",
+    "pro",
+    "flash",
+    "flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+CLI_CODEX_MODELS = [
+    "auto",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+]
 
 AI_PROMPT_SYSTEM_BASE = (
     "You are a professional manga translator and dialogue localizer.\n"
@@ -696,7 +718,23 @@ def _gemini_generate_json(api_key: str, model: str, system_text: str, user_parts
         raise Exception("Gemini returned empty text")
     return txt
 
-def _cli_gemini_generate_json(system_text: str, user_parts: list[str]) -> str:
+def _short_gemini_cli_error(detail: str) -> str:
+    text = str(detail or "").strip()
+    low = text.lower()
+    if (
+        "usage limit" in low
+        or "quota exceeded" in low
+        or "resource exhausted" in low
+        or "daily limit" in low
+        or "limit reached" in low
+        or "too many requests" in low
+    ):
+        m = re.search(r"try again(?: at| in)?\s+([^\r\n.]+)", text, re.I)
+        retry = f" Try again {m.group(1).strip()}." if m else ""
+        return f"Gemini CLI usage limit reached.{retry}"
+    return text[:500]
+
+def _cli_gemini_generate_json(system_text: str, user_parts: list[str], model: str = "auto") -> str:
     import subprocess, shutil
     text_parts = []
     for p in user_parts:
@@ -723,7 +761,7 @@ def _cli_gemini_generate_json(system_text: str, user_parts: list[str]) -> str:
             exe = ps1
         
     timeout_sec = float(CLI_TIMEOUT_SEC)
-    cmd = [exe, full_prompt]
+    cmd = [exe, full_prompt, (model or "auto").strip() or "auto"]
     print(
         f"[TextPhantom][trace] cli.gemini.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
         flush=True,
@@ -747,7 +785,7 @@ def _cli_gemini_generate_json(system_text: str, user_parts: list[str]) -> str:
             err = (result.stderr or "").strip()
             out = (result.stdout or "").strip()
             detail = err or out or "no output"
-            raise Exception(f"Gemini CLI error (Code {result.returncode}): {detail[:500]}")
+            raise Exception(f"Gemini CLI error (Code {result.returncode}): {_short_gemini_cli_error(detail)}")
         txt = (result.stdout or "").strip()
         if not txt:
             err = (result.stderr or "").strip()
@@ -759,8 +797,21 @@ def _cli_gemini_generate_json(system_text: str, user_parts: list[str]) -> str:
     except Exception as e:
         raise Exception(f"Gemini CLI execution failed: {str(e)}")
 
-def _cli_codex_generate_json(system_text: str, user_parts: list[str]) -> str:
-    import subprocess, shutil
+def _normalize_codex_effort(effort: str) -> str:
+    e = (effort or "").strip().lower()
+    return e if e in ("low", "medium", "high", "xhigh") else "medium"
+
+def _short_codex_cli_error(detail: str) -> str:
+    text = str(detail or "").strip()
+    low = text.lower()
+    if "usage limit" in low or "you've hit your usage limit" in low or "you have hit your usage limit" in low:
+        m = re.search(r"try again at\s+([^\r\n.]+)", text, re.I)
+        retry = f" Try again at {m.group(1).strip()}." if m else ""
+        return f"Codex CLI usage limit reached.{retry}"
+    return text[:500]
+
+def _cli_codex_generate_json(system_text: str, user_parts: list[str], model: str = "auto", reasoning_effort: str = "medium") -> str:
+    import subprocess, shutil, tempfile
     prompt_parts = [system_text]
     for p in user_parts:
         if (p or "").strip():
@@ -773,9 +824,13 @@ def _cli_codex_generate_json(system_text: str, user_parts: list[str]) -> str:
         raise Exception("Codex CLI not found. Please install it globally.")
         
     timeout_sec = float(CLI_TIMEOUT_SEC)
-    cmd = [exe, "exec", full_prompt]
+    reasoning_effort = _normalize_codex_effort(reasoning_effort)
+    out_path = tempfile.NamedTemporaryFile(
+        prefix="textphantom_codex_", suffix=".txt", delete=False
+    ).name
+    cmd = [exe, full_prompt, (model or "auto").strip() or "auto", out_path, reasoning_effort]
     print(
-        f"[TextPhantom][trace] cli.codex.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
+        f"[TextPhantom][trace] cli.codex.queue exe={exe!r} model={(model or 'auto')!r} effort={reasoning_effort!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
         flush=True,
     )
     started = time.time()
@@ -797,8 +852,19 @@ def _cli_codex_generate_json(system_text: str, user_parts: list[str]) -> str:
             err = (result.stderr or "").strip()
             out = (result.stdout or "").strip()
             detail = err or out or "no output"
-            raise Exception(f"Codex CLI error (Code {result.returncode}): {detail[:500]}")
-        txt = (result.stdout or "").strip()
+            raise Exception(f"Codex CLI error (Code {result.returncode}): {_short_codex_cli_error(detail)}")
+        txt = ""
+        try:
+            if os.path.exists(out_path):
+                with open(out_path, "r", encoding="utf-8", errors="replace") as f:
+                    txt = f.read().strip()
+        finally:
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+        if not txt:
+            txt = (result.stdout or "").strip()
         if not txt:
             err = (result.stderr or "").strip()
             raise Exception(f"Codex CLI returned empty output{': ' + err[:500] if err else ''}")
@@ -807,6 +873,10 @@ def _cli_codex_generate_json(system_text: str, user_parts: list[str]) -> str:
         print(f"[TextPhantom][trace] cli.codex.timeout timeout={timeout_sec:.0f}s", flush=True)
         raise Exception(f"Codex CLI request timed out ({timeout_sec:.0f}s)")
     except Exception as e:
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
         raise Exception(f"Codex CLI execution failed: {str(e)}")
 
 def _infer_cli_target_language(system_text: str) -> str:
@@ -840,10 +910,13 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         gemini_js = os.path.join(
             gemini_dir, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"
         )
+        model_arg = (cmd[2] if len(cmd) > 2 else "auto").strip() or "auto"
+        model_flags = ["--model", model_arg] if model_arg else []
         if os.path.exists(gemini_js):
             run_cmd = [
                 node_exe,
                 gemini_js,
+                *model_flags,
                 "-p",
                 cmd[1] if len(cmd) > 1 else "",
                 "--output-format",
@@ -856,6 +929,7 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         else:
             run_cmd = [
                 cmd[0],
+                *model_flags,
                 "-p",
                 cmd[1] if len(cmd) > 1 else "",
                 "--output-format",
@@ -870,6 +944,29 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
             f"[TextPhantom][trace] cli.gemini.env no_relaunch=true sandbox=1 node={node_exe!r}",
             flush=True,
         )
+    elif tool_name == "codex":
+        model_arg = (cmd[2] if len(cmd) > 2 else "auto").strip() or "auto"
+        out_path = cmd[3] if len(cmd) > 3 else ""
+        effort_arg = _normalize_codex_effort(cmd[4] if len(cmd) > 4 else "medium")
+        model_flags = ["--model", model_arg] if model_arg.lower() != "auto" else []
+        run_cmd = [
+            cmd[0],
+            "--ask-for-approval",
+            "never",
+            "exec",
+            *model_flags,
+            "-c",
+            f'model_reasoning_effort="{effort_arg}"',
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+        ]
+        if out_path:
+            run_cmd.extend(["--output-last-message", out_path])
+        run_cmd.append(cmd[1] if len(cmd) > 1 else "")
+        stdin_mode = None
 
     proc = subprocess.Popen(
         run_cmd,

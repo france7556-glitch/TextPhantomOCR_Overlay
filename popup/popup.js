@@ -125,6 +125,7 @@ const FALLBACK_SOURCES = [
   { id: "original", name: "Original" },
   { id: "translated", name: "Translated" },
   { id: "ai", name: "Ai" },
+  { id: "cli", name: "CLI Tools" },
 ];
 
 const HEALTH_PATH = "/health";
@@ -139,6 +140,28 @@ const PROMPT_TIMEOUT_MS = 8000;
 const WARMUP_TIMEOUT_MS = 2500;
 const RETRY_DELAYS_MS = [600, 1200, 2500, 5000];
 
+const CLI_GEMINI_MODELS = [
+  "auto",
+  "pro",
+  "flash",
+  "flash-lite",
+  "gemini-3.1-pro-preview",
+  "gemini-3-pro-preview",
+  "gemini-3-flash-preview",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+];
+
+const CLI_CODEX_MODELS = [
+  "auto",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.3-codex",
+  "gpt-5.2",
+];
+
 const modeSel = document.getElementById("mode");
 const langSel = document.getElementById("lang");
 const sourcesSel = document.getElementById("sources");
@@ -152,6 +175,8 @@ const aiBaseUrlWrap = document.getElementById("ai-baseurl-wrap");
 const aiBaseUrlInput = document.getElementById("ai-baseurl");
 const aiModelWrap = document.getElementById("ai-model-wrap");
 const aiModelSel = document.getElementById("ai-model");
+const codexEffortWrap = document.getElementById("codex-effort-wrap");
+const codexEffortSel = document.getElementById("codex-effort");
 const aiPromptWrap = document.getElementById("ai-prompt-wrap");
 const aiPromptInput = document.getElementById("ai-prompt");
 const aiPromptCountEl = document.getElementById("ai-prompt-count");
@@ -191,6 +216,7 @@ let desiredSources = "translated";
 let desiredCliTool = "cli_gemini";
 let desiredAiModel = "auto";
 let desiredAiBaseUrl = "";
+let desiredCodexEffort = "medium";
 
 let aiPromptByLangState = {};
 let aiPromptDefaultsByLang = {};
@@ -475,6 +501,11 @@ function isLocalAiKey(key) {
   return ["local", "ollama", "lmstudio", "llama", "llama-server", "localhost", "none", "dummy", "no-key"].includes(k) || k.startsWith("local-") || k.startsWith("local_");
 }
 
+function normalizeCodexEffort(effort) {
+  const e = String(effort || "").trim().toLowerCase();
+  return ["low", "medium", "high", "xhigh"].includes(e) ? e : "medium";
+}
+
 function toggleUi() {
   const modeId = modeSel.value || "lens_text";
   const isText = modeId === "lens_text";
@@ -498,7 +529,8 @@ function toggleUi() {
 
   aiKeyWrap.style.display = (showAi && !isCliSource) ? "" : "none";
   if (aiBaseUrlWrap) aiBaseUrlWrap.style.display = showBaseUrl ? "" : "none";
-  aiModelWrap.style.display = (showAi && canConfigureAi) ? "" : "none";
+  aiModelWrap.style.display = (showAi && (canConfigureAi || isCliSource)) ? "" : "none";
+  if (codexEffortWrap) codexEffortWrap.style.display = showAi && isCliSource && cliToolSel.value === "cli_codex" ? "" : "none";
   aiPromptWrap.style.display = showAi && (canConfigureAi || isCliSource) ? "" : "none";
 }
 
@@ -547,6 +579,7 @@ async function refreshMeta(baseUrl) {
       }
       if (Object.keys(patch).length) await chrome.storage.local.set(patch);
       toggleUi();
+      if (shouldRefreshAiMetaForCurrentUi()) refreshAiMeta({ forcePrompt: false });
     }
   } catch {}
 }
@@ -573,16 +606,18 @@ function setModelOptions(models, { keepValue = "", strict = true } = {}) {
     "auto";
   aiModelSel.innerHTML = "";
   const base = [{ id: "auto", name: "auto" }];
+  const seen = new Set(base.map((m) => m.id));
   const list = (Array.isArray(models) ? models : [])
     .map((m) => ({
       id: String(m || ""),
       name: String(m || ""),
     }))
-    .filter((m) => m.id)
+    .filter((m) => m.id && !seen.has(m.id) && seen.add(m.id))
     .sort((a, b) =>
       a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
     );
-  const canKeep = prev && [...new Set(list.map((m) => m.id))].includes(prev);
+  const optionIds = new Set(base.concat(list).map((m) => m.id));
+  const canKeep = prev && optionIds.has(prev);
   if (!strict && prev && prev !== "auto" && !canKeep)
     list.unshift({ id: prev, name: prev });
   for (const it of base.concat(list)) {
@@ -592,6 +627,36 @@ function setModelOptions(models, { keepValue = "", strict = true } = {}) {
     aiModelSel.appendChild(opt);
   }
   aiModelSel.value = canKeep ? prev : "auto";
+}
+
+function shouldRefreshAiMetaForCurrentUi() {
+  return (
+    (modeSel.value || "lens_text") === "lens_text" &&
+    ["ai", "cli"].includes((sourcesSel.value || "").trim())
+  );
+}
+
+function currentModelOptionsFallback() {
+  const source = (sourcesSel.value || "").trim();
+  const cliTool = cliToolSel.value || "cli_gemini";
+  if (source === "cli" && cliTool === "cli_gemini") {
+    return CLI_GEMINI_MODELS;
+  }
+  if (source === "cli" && cliTool === "cli_codex") {
+    return CLI_CODEX_MODELS;
+  }
+  return [];
+}
+
+function selectedAiModelValue() {
+  const selected = normalizeAiModel((aiModelSel.value || "").trim());
+  const hasOnlyAuto =
+    aiModelSel.options.length === 1 &&
+    (aiModelSel.options[0]?.value || "") === "auto";
+  if (hasOnlyAuto && desiredAiModel && desiredAiModel !== "auto") {
+    return desiredAiModel;
+  }
+  return selected || desiredAiModel || "auto";
 }
 
 async function refreshAiMeta({ forcePrompt = false } = {}) {
@@ -611,7 +676,12 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
     return;
   }
 
-  if (source === "cli") {
+  const fallbackModels = currentModelOptionsFallback();
+  if (fallbackModels.length) {
+    setModelOptions(fallbackModels, { keepValue: desiredAiModel, strict: true });
+  }
+
+  if (source === "cli" && !["cli_gemini", "cli_codex"].includes(cliToolSel.value)) {
     const providerLabel = cliToolSel.value === "cli_gemini" ? "Gemini CLI" : "Codex CLI";
     setAiKeyStatus("ok", `✓ ${providerLabel} ready`);
     setModelOptions([], { keepValue: "auto" });
@@ -621,9 +691,10 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
   }
 
   const seq = ++aiMetaSeq;
-  const aiKey = (aiKeyInput.value || "").trim();
+  const isCliSource = source === "cli";
+  const aiKey = isCliSource ? (cliToolSel.value || "cli_gemini") : (aiKeyInput.value || "").trim();
 
-  if (!aiKey) {
+  if (!isCliSource && !aiKey) {
     setAiKeyStatus("none");
     return;
   }
@@ -633,12 +704,19 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
   try {
     const lang = langSel.value || "en";
     const currentModel =
-      (aiModelSel.value || "").trim() || desiredAiModel || "auto";
+      selectedAiModelValue();
 
     const aiBaseUrl = (aiBaseUrlInput?.value || "").trim() || "";
     const data = await fetchJson(
       `${base}${AI_RESOLVE_PATH}`,
-      { api_key: aiKey, model: currentModel, lang, base_url: aiBaseUrl || "auto" },
+      {
+        api_key: aiKey,
+        model: currentModel,
+        lang,
+        base_url: aiBaseUrl || "auto",
+        provider: isCliSource ? (cliToolSel.value || "cli_gemini") : "auto",
+        reasoning_effort: normalizeCodexEffort(codexEffortSel?.value || desiredCodexEffort),
+      },
       AI_META_TIMEOUT_MS,
     );
     if (seq !== aiMetaSeq) return;
@@ -722,9 +800,10 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
 
     if (nextModel !== currentModel) {
       desiredAiModel = nextModel;
-      await chrome.storage.local.set({ aiKey, aiModel: nextModel });
+      if (isCliSource) await chrome.storage.local.set({ aiModel: nextModel });
+      else await chrome.storage.local.set({ aiKey, aiModel: nextModel });
     } else {
-      await chrome.storage.local.set({ aiKey });
+      if (!isCliSource) await chrome.storage.local.set({ aiKey });
     }
 
     // Show success status
@@ -881,9 +960,11 @@ function scheduleSaveAi() {
     desiredAiBaseUrl = aiBaseUrl;
     if (modeId !== "lens_text") {
       const aiKey = (aiKeyInput.value || "").trim();
-      const aiModel = normalizeAiModel((aiModelSel.value || "").trim() || desiredAiModel || "auto");
+      const aiModel = selectedAiModelValue();
       desiredAiModel = aiModel;
-      await chrome.storage.local.set({ aiKey, aiModel, aiBaseUrl });
+      const codexEffort = normalizeCodexEffort(codexEffortSel?.value || desiredCodexEffort);
+      desiredCodexEffort = codexEffort;
+      await chrome.storage.local.set({ aiKey, aiModel, aiBaseUrl, codexEffort });
       chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
       return;
     }
@@ -891,8 +972,10 @@ function scheduleSaveAi() {
     const source = (sourcesSel.value || "").trim() || "translated";
     const lang = desiredLang || langSel.value || "en";
     const aiKey = (aiKeyInput.value || "").trim();
-    const aiModel = normalizeAiModel((aiModelSel.value || "").trim() || desiredAiModel || "auto");
+    const aiModel = selectedAiModelValue();
+    const codexEffort = normalizeCodexEffort(codexEffortSel?.value || desiredCodexEffort);
     desiredAiModel = aiModel;
+    desiredCodexEffort = codexEffort;
 
     const key = makePromptKey(lang, aiModel);
     if (aiPromptDirtyByLang[key]) {
@@ -905,20 +988,20 @@ function scheduleSaveAi() {
       aiKey,
       aiModel,
       aiBaseUrl,
+      codexEffort,
       aiPromptByLang: aiPromptByLangState,
     });
     chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
     modelDirty = true;
     toggleUi();
-    if (source === "ai") refreshAiMeta({ forcePrompt: false });
+    if (source === "ai" || source === "cli") refreshAiMeta({ forcePrompt: false });
   }, 400);
 }
 
 function scheduleResolveAiMeta({ immediate = false } = {}) {
   if (aiResolveDebounce) clearTimeout(aiResolveDebounce);
   const run = () => {
-    if ((modeSel.value || "lens_text") !== "lens_text") return;
-    if ((sourcesSel.value || "").trim() !== "ai") return;
+    if (!shouldRefreshAiMetaForCurrentUi()) return;
     refreshAiMeta({ forcePrompt: false });
   };
   if (immediate) {
@@ -976,6 +1059,7 @@ async function loadSettings() {
     "aiBaseUrl",
     "aiPromptByLang",
     "cliTool",
+    "codexEffort",
   ]);
 
   modeSel.value = stored.mode || "lens_text";
@@ -993,6 +1077,7 @@ async function loadSettings() {
     typeof stored.cliTool === "string" && stored.cliTool
       ? stored.cliTool
       : "cli_gemini";
+  desiredCodexEffort = normalizeCodexEffort(stored.codexEffort || "medium");
 
   setSelectOptions(langSel, FALLBACK_LANGS, {
     valueKey: "code",
@@ -1008,6 +1093,7 @@ async function loadSettings() {
   langSel.value = desiredLang;
   sourcesSel.value = desiredSources;
   cliToolSel.value = desiredCliTool;
+  if (codexEffortSel) codexEffortSel.value = desiredCodexEffort;
 
   const storedCustom = String(stored.customApiUrl || "");
   lastSavedApiUrl = storedCustom;
@@ -1032,7 +1118,7 @@ async function loadSettings() {
 
   aiKeyInput.value = aiKey;
   if (aiBaseUrlInput) aiBaseUrlInput.value = desiredAiBaseUrl;
-  setModelOptions([], { keepValue: desiredAiModel });
+  setModelOptions(currentModelOptionsFallback(), { keepValue: desiredAiModel });
   aiPromptInput.value = prompt;
   updatePromptCount(prompt);
 
@@ -1050,11 +1136,12 @@ async function loadSettings() {
       if (!normalizeUrl(apiInput.value)) {
         apiInput.value = def;
         checkHealth(def);
+        if (shouldRefreshAiMetaForCurrentUi()) refreshAiMeta({ forcePrompt: false });
       }
     })
     .catch(() => {});
 
-  if ((sourcesSel.value || "").trim() === "ai" && modeSel.value === "lens_text") {
+  if (shouldRefreshAiMetaForCurrentUi()) {
     applyPromptForLang(desiredLang, { forceFetch: false }).catch(() => {});
     refreshAiMeta({ forcePrompt: false });
   }
@@ -1090,9 +1177,11 @@ window.addEventListener("pagehide", () => {
 
     const modeId = modeSel.value || "lens_text";
     const aiKey = (aiKeyInput.value || "").trim();
-    const aiModel = normalizeAiModel((aiModelSel.value || "").trim() || desiredAiModel || "auto");
+    const aiModel = selectedAiModelValue();
+    const codexEffort = normalizeCodexEffort(codexEffortSel?.value || desiredCodexEffort);
     const aiBaseUrl = (aiBaseUrlInput?.value || "").trim();
     desiredAiModel = aiModel;
+    desiredCodexEffort = codexEffort;
 
     if (modeId === "lens_text") {
       const lang = desiredLang || langSel.value || "en";
@@ -1108,10 +1197,11 @@ window.addEventListener("pagehide", () => {
           aiKey,
           aiModel,
           aiBaseUrl,
+          codexEffort,
           aiPromptByLang: aiPromptByLangState,
         });
     } else if (pendingAiSave) {
-      chrome.storage.local.set({ aiKey, aiModel, aiBaseUrl });
+      chrome.storage.local.set({ aiKey, aiModel, aiBaseUrl, codexEffort });
     }
   } catch {}
 });
@@ -1167,6 +1257,12 @@ cliToolSel.addEventListener("change", async () => {
   await chrome.storage.local.set({ cliTool: desiredCliTool });
   toggleUi();
   refreshAiMeta({ forcePrompt: false });
+  chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
+});
+
+codexEffortSel?.addEventListener("change", async () => {
+  desiredCodexEffort = normalizeCodexEffort(codexEffortSel.value || desiredCodexEffort);
+  await chrome.storage.local.set({ codexEffort: desiredCodexEffort });
   chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
 });
 
