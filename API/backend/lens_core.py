@@ -458,6 +458,31 @@ AI_PROMPT_SYSTEM_BASE = (
     "If the input is already in the target language, improve it (dialogue polish) without changing meaning."
 )
 
+THAI_MANGA_PROMPT = """You are an expert Manga/Manhwa translator localizing content into highly natural, fluent, and colloquial Thai. You will receive raw text extracted via OCR. You DO NOT have access to the visual context (images).
+
+Your translation MUST adhere to the following STRICT rules:
+
+1. MARKER PRESERVATION (CRITICAL):
+You will see position markers like <<TP_P0>>, <<TP_P1>>, etc. You MUST preserve every single marker exactly as it appears. Do not translate them, do not remove them, and do not change their order.
+
+2. CONTEXTUAL INFERENCE & TONE:
+Since you cannot see the characters, infer their relationships, genders, and emotions solely from the dialogue.
+- Use natural spoken Thai (ภาษาพูด), not formal written Thai.
+- Avoid robotic or literal word-for-word translations. Adapt idioms, jokes, and slangs to their closest natural Thai equivalents.
+- Use appropriate Thai pronouns based on the inferred context (e.g., ฉัน/เธอ, นาย/ฉัน, แก/ฉัน, ข้า/เอ็ง for fantasy/historical). If completely unsure, default to gender-neutral but natural pronouns.
+
+3. SOUND EFFECTS & ONOMATOPOEIA:
+Translate sound effects into matching Thai sound effects (e.g., "Bang!" -> "ปัง!", "Swish" -> "ฟุ่บ!").
+
+4. OUTPUT FORMAT:
+Output ONLY the translated text with its original markers. Do not add any explanations, notes, or conversational filler.
+
+Example Input:
+<<TP_P0>> Damn it! <<TP_P1>> I told you not to go near that monster! <<TP_P2>> Boom!
+
+Example Output:
+<<TP_P0>> บ้าเอ๊ย! <<TP_P1>> ฉันบอกนายแล้วไงว่าอย่าเข้าไปใกล้สัตว์ประหลาดนั่น! <<TP_P2>> ตู้ม!"""
+
 AI_LANG_STYLE = {
     "th": (
         "Target language: Thai\n"
@@ -493,6 +518,7 @@ AI_LANG_STYLE = {
         "Output ONLY the translated text."
     ),
 }
+AI_LANG_STYLE["th"] = THAI_MANGA_PROMPT
 
 
 AI_PROMPT_RESPONSE_CONTRACT_JSON = (
@@ -737,16 +763,14 @@ def _cli_gemini_generate_json(system_text: str, user_parts: list[str], model: st
     for p in user_parts:
         if (p or "").strip():
             text_parts.append(p.strip())
-    target = _infer_cli_target_language(system_text)
-    rules_text = re.sub(r"\s+", " ", str(system_text or "").strip())
     ocr_text = "\n\n".join(text_parts)
     ocr_text = re.sub(r"(?i)^\s*Input\s*:\s*", "", ocr_text.strip())
-    ocr_text = re.sub(r"\s+", " ", ocr_text).strip()
-    full_prompt = (
-        f"TASK: Translate this exact OCR text to {target}. Return only translated text. "
-        "Preserve all paragraph markers like <<TP_P0>> unchanged and in order. "
-        f"RULES: {rules_text} OCR_TEXT: {ocr_text}"
-    )
+    full_prompt = "\n\n".join(
+        [
+            str(system_text or "").strip(),
+            "Input:\n" + ocr_text,
+        ]
+    ).strip()
     
     exe = shutil.which("gemini")
     if not exe:

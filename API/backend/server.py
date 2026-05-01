@@ -1,4 +1,4 @@
-import asyncio, base64, copy, hashlib, io, json, os, re, tempfile, time, uuid, httpx, logging
+import asyncio, base64, contextvars, copy, hashlib, io, json, os, re, tempfile, time, uuid, httpx, logging
 
 from backend import lens_core as core
 from http import HTTPStatus
@@ -31,6 +31,8 @@ _result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _ai_result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_queue: asyncio.Queue = asyncio.Queue()
+_jobs_lock = Lock()
+_CURRENT_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar('tp_job_id', default='')
 _result_cache_lock = Lock()
 _ai_cache_lock = Lock()
 
@@ -73,7 +75,86 @@ def _dbg(tag: str, data=None) -> None:
         except Exception:
             pass
 
+def _job_stage_from_trace(tag: str, data=None) -> str:
+    if tag == 'payload.start':
+        return 'download'
+    if tag == 'payload.image.ready':
+        return 'image_ready'
+    if tag == 'payload.ai.config':
+        return 'ai_config'
+    if tag == 'payload.cache.hit':
+        return 'cache_hit'
+    if tag == 'payload.process.begin':
+        return 'process'
+    if tag == 'image.single.begin':
+        return 'lens_ocr'
+    if tag == 'ai.call.begin':
+        provider = ''
+        try:
+            provider = str((data or {}).get('provider') or '').strip()
+        except Exception:
+            provider = ''
+        return provider or 'ai'
+    if tag == 'ai.retry.begin':
+        return 'ai_retry'
+    if tag == 'ai.retry.done':
+        return 'ai_retry_done'
+    if tag == 'ai.call.done':
+        return 'ai_done'
+    if tag in ('image.single.stage', 'image.merge.stage'):
+        try:
+            return str((data or {}).get('stage') or '').strip()
+        except Exception:
+            return ''
+    return ''
+
+def _update_job(jid: str, **fields) -> None:
+    if not jid:
+        return
+    now = _now()
+    with _jobs_lock:
+        cur = dict(_jobs.get(jid) or {})
+        cur.update(fields)
+        cur['ts'] = now
+        _jobs[jid] = cur
+
+def _set_current_job_stage(stage: str, detail: Optional[Dict[str, Any]] = None) -> None:
+    stage = str(stage or '').strip()
+    if not stage:
+        return
+    jid = _CURRENT_JOB_ID.get('')
+    if not jid:
+        return
+    now = _now()
+    with _jobs_lock:
+        cur = dict(_jobs.get(jid) or {})
+        if cur.get('stage') != stage:
+            cur['stage_started_at'] = now
+        cur['status'] = cur.get('status') or 'running'
+        cur['stage'] = stage
+        if detail:
+            cur['stage_detail'] = detail
+        cur['ts'] = now
+        _jobs[jid] = cur
+
+def _snapshot_job(jid: str) -> Optional[Dict[str, Any]]:
+    with _jobs_lock:
+        j = _jobs.get(jid)
+        if not j:
+            return None
+        out = dict(j)
+    now = _now()
+    started = float(out.get('started_at') or out.get('ts') or now)
+    stage_started = float(out.get('stage_started_at') or started)
+    out['elapsed_ms'] = round((now - started) * 1000, 1)
+    out['stage_elapsed_ms'] = round((now - stage_started) * 1000, 1)
+    return out
+
 def _trace(tag: str, data=None) -> None:
+    stage = _job_stage_from_trace(tag, data)
+    if stage:
+        detail = data if isinstance(data, dict) else None
+        _set_current_job_stage(stage, detail)
     if not TP_TRACE:
         return
     try:
@@ -437,6 +518,7 @@ def _build_ai_prompt_packet_custom(target_lang: str, original_text_full: str, pr
     base = (getattr(core, "AI_PROMPT_SYSTEM_BASE", "") or "").strip()
 
     style = (prompt_editable or "").strip()
+    user_supplied_prompt = bool(style)
     if not style:
         style = (
             (getattr(core, "AI_LANG_STYLE", {}) or {}).get(lang)
@@ -454,12 +536,77 @@ def _build_ai_prompt_packet_custom(target_lang: str, original_text_full: str, pr
             "Retry: You MUST output ALL markers from the first to the last marker in the input."
         )
 
-    system_text = "\n\n".join(
-        [p for p in [base, style, "\n".join(contract_parts)] if p]
-    )
+    if user_supplied_prompt:
+        marker_guard = ""
+        if "<<TP_P" not in style and "marker" not in style.lower():
+            marker_guard = "\n\n" + "\n".join(contract_parts)
+        retry_text = (
+            "\n\nRetry: You MUST output ALL markers from the first to the last marker in the input."
+            if is_retry and "Retry:" not in marker_guard
+            else ""
+        )
+        system_text = style + marker_guard + retry_text
+    else:
+        system_text = "\n\n".join(
+            [p for p in [base, style, "\n".join(contract_parts)] if p]
+        )
 
     user_parts: List[str] = ["Input:\n" + str(original_text_full or "")]
     return system_text, user_parts
+
+def _is_cli_retryable_error(e: Exception) -> bool:
+    msg = str(e or '').lower()
+    if not msg:
+        return False
+    permanent = (
+        'usage limit',
+        'quota',
+        'resource exhausted',
+        'daily limit',
+        'limit reached',
+        'not found',
+        'please install',
+        'api_key',
+        'api key',
+        'model not found',
+    )
+    if any(x in msg for x in permanent):
+        return False
+    retryable = (
+        'timed out',
+        'timeout',
+        'empty output',
+        'no output',
+        'execution failed',
+        'econnreset',
+        'connection',
+        'spawn',
+        'eperm',
+        'temporarily',
+    )
+    return any(x in msg for x in retryable)
+
+def _generate_ai_raw(provider: str, api_key: str, base_url: str, model: str, system_text: str, user_parts: List[str], ai: AiConfig):
+    if provider == 'cli_gemini':
+        raw = core._cli_gemini_generate_json(system_text, user_parts, model)
+        return raw, model
+    if provider == 'cli_codex':
+        raw = core._cli_codex_generate_json(
+            system_text, user_parts, model, ai.reasoning_effort)
+        return raw, model
+    if provider == 'gemini':
+        raw = core._gemini_generate_json(
+            api_key, model, system_text, user_parts)
+        return raw, model
+    if provider == 'anthropic':
+        raw = core._anthropic_generate_json(
+            api_key, model, system_text, user_parts)
+        return raw, model
+    if _is_hf_provider(provider, base_url):
+        return _openai_compat_generate_with_hf_backoff(
+            api_key, base_url, model, system_text, user_parts)
+    return core._openai_compat_generate_json(
+        api_key, base_url, model, system_text, user_parts)
 
 def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, is_retry: bool = False) -> dict:
     if not _has_meaningful_text(original_text_full):
@@ -512,25 +659,25 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         'system_len': len(system_text),
         'user_parts': len(user_parts),
     })
-    if provider == 'cli_gemini':
-        raw = core._cli_gemini_generate_json(system_text, user_parts, model)
-        used_model = model
-    elif provider == 'cli_codex':
-        raw = core._cli_codex_generate_json(system_text, user_parts, model, ai.reasoning_effort)
-        used_model = model
-    elif provider == 'gemini':
-        raw = core._gemini_generate_json(
-            api_key, model, system_text, user_parts)
-    elif provider == 'anthropic':
-        raw = core._anthropic_generate_json(
-            api_key, model, system_text, user_parts)
-    else:
-        if _is_hf_provider(provider, base_url):
-            raw, used_model = _openai_compat_generate_with_hf_backoff(
-                api_key, base_url, model, system_text, user_parts)
-        else:
-            raw, used_model = core._openai_compat_generate_json(
-                api_key, base_url, model, system_text, user_parts)
+    cli_provider = provider in ('cli_gemini', 'cli_codex')
+    try:
+        raw, used_model = _generate_ai_raw(
+            provider, api_key, base_url, model, system_text, user_parts, ai)
+    except Exception as e:
+        if not cli_provider or not _is_cli_retryable_error(e):
+            raise
+        _trace('ai.retry.begin', {
+            'provider': provider,
+            'model': model,
+            'reason': str(e)[:500],
+        })
+        time.sleep(1.5)
+        raw, used_model = _generate_ai_raw(
+            provider, api_key, base_url, model, system_text, user_parts, ai)
+        _trace('ai.retry.done', {
+            'provider': provider,
+            'model': used_model,
+        })
 
     ai_text_full = core._parse_ai_textfull_only(
         raw) if core.DO_AI_JSON else core._parse_ai_textfull_text_only(raw)
@@ -1378,10 +1525,11 @@ async def _cleanup_jobs_loop():
     while True:
         await asyncio.sleep(60)
         cutoff = _now() - JOB_TTL_SEC
-        dead = [jid for jid, j in _jobs.items() if float(
-            j.get('ts', 0)) < cutoff]
-        for jid in dead:
-            _jobs.pop(jid, None)
+        with _jobs_lock:
+            dead = [jid for jid, j in _jobs.items() if float(
+                j.get('ts', 0)) < cutoff]
+            for jid in dead:
+                _jobs.pop(jid, None)
 
 async def _worker_loop(worker_id: int):
     while True:
@@ -1397,9 +1545,16 @@ async def _worker_loop(worker_id: int):
                 'has_datauri': bool(payload.get('imageDataUri')),
                 'has_src': bool(payload.get('src')),
             })
-            _jobs[jid] = {'status': 'running', 'ts': _now()}
-            result = await asyncio.to_thread(_process_payload, payload)
-            _jobs[jid] = {'status': 'done', 'result': result, 'ts': _now()}
+            started_at = _now()
+            _update_job(jid, status='running', stage='starting',
+                        started_at=started_at, stage_started_at=started_at)
+            token = _CURRENT_JOB_ID.set(jid)
+            try:
+                result = await asyncio.to_thread(_process_payload, payload)
+            finally:
+                _CURRENT_JOB_ID.reset(token)
+            _update_job(jid, status='done', stage='done', result=result,
+                        stage_started_at=_now())
             _trace('job.done', {
                 'id': jid,
                 'worker': worker_id,
@@ -1408,7 +1563,8 @@ async def _worker_loop(worker_id: int):
                 'perf': result.get('perf') if isinstance(result, dict) else None,
             })
         except Exception as e:
-            _jobs[jid] = {'status': 'error', 'result': str(e), 'ts': _now()}
+            _update_job(jid, status='error', stage='error',
+                        result=str(e), stage_started_at=_now())
             _trace('job.error', {
                 'id': jid,
                 'worker': worker_id,
@@ -1625,13 +1781,15 @@ async def translate(payload: Dict[str, Any]):
         'has_datauri': bool(payload.get('imageDataUri')),
         'has_src': bool(payload.get('src')),
     })
-    _jobs[jid] = {'status': 'queued', 'ts': _now()}
+    now = _now()
+    _update_job(jid, status='queued', stage='queued',
+                queued_at=now, stage_started_at=now)
     await _job_queue.put((jid, payload))
     return {'id': jid}
 
 @app.get('/translate/{job_id}')
 async def translate_status(job_id: str):
-    j = _jobs.get(job_id)
+    j = _snapshot_job(job_id)
     if not j:
         return {'status': 'error', 'result': 'job_not_found'}
     return j

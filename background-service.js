@@ -29,7 +29,7 @@ const MAX_FIRST_TRY_RETRIES = 2;
 const FIRST_TRY_GAP_MS = 3000;
 
 const REST_POLL_TIMEOUT_MS = 180000;
-const REST_POLL_TIMEOUT_AI_MS = 660000;
+const REST_POLL_TIMEOUT_AI_MS = 1900000;
 
 const WARMUP_PATH = "/warmup";
 const WARMUP_TIMEOUT_MS = 2500;
@@ -864,6 +864,26 @@ async function pollJobViaRest(
     const ctx = pendingByJob.get(jid);
     if (!ctx) return;
     const isImageMode = String(ctx?.mode || "") === "lens_images";
+    const serverStage = String(data?.stage || "").trim();
+    const serverStageElapsed = Number(data?.stage_elapsed_ms || 0);
+    if (serverStage && serverStage !== ctx.lastServerStage) {
+      ctx.lastServerStage = serverStage;
+      ev("job.poll.stage", {
+        id: jid,
+        status: st || "",
+        stage: serverStage,
+        stageElapsedMs: serverStageElapsed || 0,
+      });
+      const batchId0 = String(
+        ctx?.batchId || ctx?.metadata?.batch_id || "",
+      ).trim();
+      const batch0 = batchId0
+        ? ensureBatch(batchId0, ctx.tabId || 0, ctx.frameId || 0)
+        : null;
+      if (batch0 && !["done", "error", "cache_hit"].includes(serverStage)) {
+        batchUpdateToast(batch0, serverStage);
+      }
+    }
     ticks++;
     if (st && st !== lastSt) {
       lastSt = st;
