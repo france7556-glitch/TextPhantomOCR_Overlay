@@ -103,7 +103,7 @@ function aiSoftMaxConcurrencyFromKey(key) {
 }
 
 function softConcurrencyForSource(source, aiKey) {
-  if (isCliSource(source)) return 10;
+  if (isCliSource(source)) return 3;
   return aiSoftMaxConcurrencyFromKey(aiKey);
 }
 

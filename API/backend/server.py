@@ -90,6 +90,9 @@ def _trace(tag: str, data=None) -> None:
         except Exception:
             pass
 
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 1)
+
 def _tree_stats(tree) -> dict:
     if not isinstance(tree, dict):
         return {'paras': 0, 'items': 0, 'spans': 0}
@@ -169,6 +172,47 @@ def _needs_ai_retry(ai_text_full: str, expected_paras: int) -> bool:
     if (TP_PARA_MARKER_PREFIX in (ai_text_full or '')) and (TP_PARA_MARKER_SUFFIX not in (ai_text_full or '')):
         return True
     return True
+
+def _marker_segment_map(ai_text_full: str, expected: int) -> Dict[int, str]:
+    seg_map: Dict[int, str] = {}
+    if expected <= 0 or not ai_text_full:
+        return seg_map
+    found = sorted(_extract_marker_indices(ai_text_full))
+    for idx in found:
+        if idx < 0 or idx >= expected:
+            continue
+        marker = f"{TP_PARA_MARKER_PREFIX}{idx}{TP_PARA_MARKER_SUFFIX}"
+        m = re.search(rf"{re.escape(marker)}\s*([\s\S]*?)(?={re.escape(TP_PARA_MARKER_PREFIX)}\d+{re.escape(TP_PARA_MARKER_SUFFIX)}|\Z)", ai_text_full)
+        seg = _collapse_ws(m.group(1) if m else '')
+        if seg and idx not in seg_map:
+            seg_map[idx] = seg
+    return seg_map
+
+def _repair_marked_ai_text(ai_text_full: str, expected: int, fallback_paras: List[str]) -> tuple[str, dict]:
+    if expected <= 0:
+        return ai_text_full or '', {
+            'marker_repaired': False,
+            'marker_expected': 0,
+            'marker_found': 0,
+            'marker_missing': 0,
+        }
+    seg_map = _marker_segment_map(ai_text_full, expected)
+    missing = 0
+    out_lines: List[str] = []
+    for i in range(expected):
+        seg = seg_map.get(i) or _collapse_ws(
+            fallback_paras[i] if i < len(fallback_paras) else '')
+        if not seg_map.get(i):
+            missing += 1
+        out_lines.append(f"{TP_PARA_MARKER_PREFIX}{i}{TP_PARA_MARKER_SUFFIX}")
+        out_lines.append(seg)
+        out_lines.append('')
+    return "\n".join(out_lines).strip("\n"), {
+        'marker_repaired': missing > 0,
+        'marker_expected': expected,
+        'marker_found': len(seg_map),
+        'marker_missing': missing,
+    }
 
 def _now() -> float:
     return time.time()
@@ -512,17 +556,42 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
     }
 
 def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
+    t_total = time.perf_counter()
     mode_id = (mode or '').strip()
     if mode_id not in SUPPORTED_MODES:
         mode_id = 'lens_images'
 
     target_lang = _normalize_lang(lang)
 
+    _trace('image.single.begin', {
+        'mode': mode_id,
+        'lang': target_lang,
+        'ai': bool(ai_cfg),
+    })
+
+    t_stage = time.perf_counter()
     data = core.get_lens_data_from_image(
         image_path, getattr(core, 'FIREBASE_URL', ''), target_lang)
+    _trace('image.single.stage', {
+        'stage': 'lens_ocr',
+        'ms': _elapsed_ms(t_stage),
+        'has_original_text': bool(isinstance(data, dict) and data.get('originalTextFull')),
+        'has_translated_text': bool(isinstance(data, dict) and data.get('translatedTextFull')),
+        'original_paras': len((data.get('originalParagraphs') or []) if isinstance(data, dict) else []),
+        'translated_paras': len((data.get('translatedParagraphs') or []) if isinstance(data, dict) else []),
+    })
+
+    t_stage = time.perf_counter()
     img = core.Image.open(image_path).convert('RGB')
     W, H = img.size
+    _trace('image.single.stage', {
+        'stage': 'image_open',
+        'ms': _elapsed_ms(t_stage),
+        'w': W,
+        'h': H,
+    })
 
+    t_stage = time.perf_counter()
     thai_font = getattr(core, 'FONT_THAI_PATH', 'NotoSansThai-Regular.ttf')
     latin_font = getattr(core, 'FONT_LATIN_PATH', 'NotoSans-Regular.ttf')
 
@@ -548,6 +617,10 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
         else:
             latin_font = core.ensure_font(
                 latin_font, getattr(core, 'FONT_LATIN_URLS', []))
+    _trace('image.single.stage', {
+        'stage': 'fonts',
+        'ms': _elapsed_ms(t_stage),
+    })
 
     image_url = data.get('imageUrl') if isinstance(data, dict) else None
 
@@ -567,6 +640,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
     }
 
     if mode_id == 'lens_images':
+        t_stage = time.perf_counter()
         if image_url:
             decoded = core.decode_imageurl_to_datauri(str(image_url))
             if decoded:
@@ -580,6 +654,13 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             with open(image_path, 'rb') as f:
                 blob = f.read()
             out['imageDataUri'] = _bytes_to_datauri(blob, 'image/jpeg')
+        _trace('image.single.done', {
+            'mode': mode_id,
+            'stage': 'lens_images_payload',
+            'ms': _elapsed_ms(t_stage),
+            'total_ms': _elapsed_ms(t_total),
+            'has_datauri': bool(out.get('imageDataUri')),
+        })
         return out
 
     original_span_tokens = None
@@ -597,6 +678,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
         )
 
     if getattr(core, 'DO_ORIGINAL', True):
+        t_stage = time.perf_counter()
         tree, _ = core.decode_tree(
             out.get('originalParagraphs') or [],
             out.get('originalTextFull') or '',
@@ -612,8 +694,14 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             'originalTree': tree,
             'originalTextFull': out.get('originalTextFull') or '',
         }
+        _trace('image.single.stage', {
+            'stage': 'decode_original_tree',
+            'ms': _elapsed_ms(t_stage),
+            'stats': _tree_stats(original_tree),
+        })
 
     if getattr(core, 'DO_TRANSLATED', True):
+        t_stage = time.perf_counter()
         tree, _ = core.decode_tree(
             out.get('translatedParagraphs') or [],
             out.get('translatedTextFull') or '',
@@ -629,6 +717,11 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             'translatedTree': tree,
             'translatedTextFull': out.get('translatedTextFull') or '',
         }
+        _trace('image.single.stage', {
+            'stage': 'decode_translated_tree',
+            'ms': _elapsed_ms(t_stage),
+            'stats': _tree_stats(translated_tree),
+        })
 
     def _tree_score(tree: Any) -> int:
         if not isinstance(tree, dict):
@@ -668,9 +761,19 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
 
     ai_tree = None
     if ai_cfg and (ai_cfg.api_key or '').strip() and getattr(core, 'DO_AI', True):
+        t_ai_total = time.perf_counter()
+        t_stage = time.perf_counter()
         src_paras = _tree_to_paragraph_texts(original_tree or {})
         src_text = _apply_para_markers(src_paras) if src_paras else str(
             out.get('originalTextFull') or '')
+        _trace('image.single.stage', {
+            'stage': 'ai_prepare_input',
+            'ms': _elapsed_ms(t_stage),
+            'paras': len(src_paras),
+            'input_len': len(str(src_text or '')),
+            'provider': ai_cfg.provider,
+            'model': ai_cfg.model,
+        })
         if not _has_meaningful_text(src_text):
             out['AiTextFull'] = ''
             out['Ai'] = {
@@ -679,17 +782,30 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
                     'skipped_reason': 'no_text',
                 }
             }
+            _trace('image.single.stage', {
+                'stage': 'ai_skipped_no_text',
+                'ms': _elapsed_ms(t_ai_total),
+            })
         else:
             ai = ai_translate_text(src_text, target_lang, ai_cfg)
             if src_paras and _needs_ai_retry(str(ai.get('aiTextFull') or ''), len(src_paras)):
-                _dbg('ai.retry', {
+                retry_found = len(_extract_marker_indices(str(ai.get('aiTextFull') or '')))
+                _trace('ai.retry.begin', {
                     'expected_paras': len(src_paras),
-                    'found_markers': len(_extract_marker_indices(str(ai.get('aiTextFull') or ''))),
+                    'found_markers': retry_found,
+                    'provider': ai_cfg.provider,
+                    'model': ai_cfg.model,
                 })
+                t_retry = time.perf_counter()
                 retry_paras = [_clamp_runaway_repeats(p) for p in src_paras]
                 retry_text = _apply_para_markers(retry_paras) or src_text
                 ai = ai_translate_text(
                     retry_text, target_lang, ai_cfg, is_retry=True)
+                _trace('ai.retry.done', {
+                    'ms': _elapsed_ms(t_retry),
+                    'expected_paras': len(src_paras),
+                    'found_markers': len(_extract_marker_indices(str(ai.get('aiTextFull') or ''))),
+                })
 
             ai_text_full = str(ai.get('aiTextFull') or '')
             meta0 = ai.get('meta') or {}
@@ -746,6 +862,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             if not isinstance(template_tree, dict):
                 template_tree = original_tree if isinstance(original_tree, dict) else (
                     translated_tree if isinstance(translated_tree, dict) else {})
+            t_stage = time.perf_counter()
             patched = core.patch(
                 {'Ai': {'aiTextFull': str(
                     ai_text_full or ''), 'aiTree': template_tree}},
@@ -756,6 +873,11 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
                 lang=target_lang,
             )
             ai_tree = (patched.get('Ai') or {}).get('aiTree') or {}
+            _trace('image.single.stage', {
+                'stage': 'ai_patch_tree',
+                'ms': _elapsed_ms(t_stage),
+                'stats_ai': _tree_stats(ai_tree),
+            })
             _dbg('ai.patched', {
                 'ai_text_len': len(ai_text_full),
                 'stats_ai': _tree_stats(ai_tree),
@@ -765,6 +887,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
                 'lang': target_lang,
             })
 
+            t_stage = time.perf_counter()
             shared_para_sizes = core._compute_shared_para_sizes(
                 [original_tree or {}, translated_tree or {}, ai_tree or {}],
                 thai_font or '',
@@ -778,6 +901,11 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             core._apply_para_font_size(ai_tree or {}, shared_para_sizes)
             core._rebuild_ai_spans_after_font_resize(
                 ai_tree or {}, W, H, thai_font or '', latin_font or '', lang=target_lang)
+            _trace('image.single.stage', {
+                'stage': 'shared_font_fit',
+                'ms': _elapsed_ms(t_stage),
+                'paras': len(shared_para_sizes or {}),
+            })
 
             out['AiTextFull'] = ai_text_full
             out['Ai'] = {
@@ -786,6 +914,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
                 'meta': meta0,
             }
             if getattr(core, 'DO_AI_HTML', True):
+                t_stage = time.perf_counter()
                 core.fit_tree_font_sizes_for_tp_html(
                     ai_tree, thai_font or '', latin_font or '', W, H)
                 out['Ai']['aihtml'] = core.ai_tree_to_tp_html(ai_tree, W, H)
@@ -794,20 +923,41 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
                     'baseH': int(H),
                     'format': 'tp',
                 }
+                _trace('image.single.stage', {
+                    'stage': 'ai_html',
+                    'ms': _elapsed_ms(t_stage),
+                    'html_len': len(str(out['Ai'].get('aihtml') or '')),
+                })
+            _trace('image.single.stage', {
+                'stage': 'ai_total',
+                'ms': _elapsed_ms(t_ai_total),
+            })
 
     if getattr(core, 'DO_ORIGINAL', True) and getattr(core, 'DO_ORIGINAL_HTML', True) and isinstance(original_tree, dict):
+        t_stage = time.perf_counter()
         core.fit_tree_font_sizes_for_tp_html(
             original_tree, thai_font or '', latin_font or '', W, H)
         if isinstance(out.get('original'), dict):
             out['original']['originalhtml'] = core.ai_tree_to_tp_html(
                 original_tree or {}, W, H)
+        _trace('image.single.stage', {
+            'stage': 'original_html',
+            'ms': _elapsed_ms(t_stage),
+            'html_len': len(str((out.get('original') or {}).get('originalhtml') or '')),
+        })
 
     if getattr(core, 'DO_TRANSLATED', True) and getattr(core, 'DO_TRANSLATED_HTML', True) and isinstance(translated_tree, dict):
+        t_stage = time.perf_counter()
         core.fit_tree_font_sizes_for_tp_html(
             translated_tree, thai_font or '', latin_font or '', W, H)
         if isinstance(out.get('translated'), dict):
             out['translated']['translatedhtml'] = core.ai_tree_to_tp_html(
                 translated_tree or {}, W, H)
+        _trace('image.single.stage', {
+            'stage': 'translated_html',
+            'ms': _elapsed_ms(t_stage),
+            'html_len': len(str((out.get('translated') or {}).get('translatedhtml') or '')),
+        })
 
     if getattr(core, 'HTML_INCLUDE_CSS', True) and (getattr(core, 'DO_ORIGINAL_HTML', True) or getattr(core, 'DO_TRANSLATED_HTML', True) or getattr(core, 'DO_AI_HTML', True)):
         out['htmlCss'] = core.tp_overlay_css()
@@ -816,10 +966,24 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             'baseH': int(H),
             'format': 'tp',
         }
+    t_stage = time.perf_counter()
     base_img = _base_img_for_overlay()
     buf = io.BytesIO()
     base_img.save(buf, format='PNG')
     out['imageDataUri'] = _bytes_to_datauri(buf.getvalue(), 'image/png')
+    _trace('image.single.stage', {
+        'stage': 'base_image_encode',
+        'ms': _elapsed_ms(t_stage),
+        'datauri_len': len(str(out.get('imageDataUri') or '')),
+    })
+
+    _trace('image.single.done', {
+        'mode': mode_id,
+        'total_ms': _elapsed_ms(t_total),
+        'w': W,
+        'h': H,
+        'has_ai_text': bool(out.get('AiTextFull')),
+    })
 
     return out
 
@@ -886,14 +1050,29 @@ def _shift_tree_y(tree: dict, offset_y_px: int, total_h_px: int, tile_h_px: int)
                         sb['center']['y'] = (old_cy_px + offset_y_px) / total_h_px
 
 def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
+    t_total = time.perf_counter()
     img = core.Image.open(image_path)
     W, H = img.size
     MAX_H = 3000
     
     if H <= MAX_H:
-        return _process_image_path_single(image_path, lang, mode, ai_cfg)
+        out = _process_image_path_single(image_path, lang, mode, ai_cfg)
+        _trace('image.process.done', {
+            'split': False,
+            'w': W,
+            'h': H,
+            'total_ms': _elapsed_ms(t_total),
+        })
+        return out
         
     # Split image into vertical tiles
+    _trace('image.split.begin', {
+        'w': W,
+        'h': H,
+        'max_h': MAX_H,
+        'mode': mode,
+        'ai': bool(ai_cfg),
+    })
     tiles = []
     y = 0
     while y < H:
@@ -902,15 +1081,45 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         tile_img = img.crop(box)
         tiles.append((y, tile_h, tile_img))
         y += tile_h
+    _trace('image.split.done', {
+        'tiles': len(tiles),
+        'total_ms': _elapsed_ms(t_total),
+    })
 
     results = []
-    for offset_y, tile_h, tile_img in tiles:
+    tile_ai_cfg = None if (ai_cfg and str(mode or '').strip() == 'lens_text') else ai_cfg
+    if ai_cfg and tile_ai_cfg is None:
+        _trace('image.split.ai_batch.enabled', {
+            'tiles': len(tiles),
+            'provider': ai_cfg.provider,
+            'model': ai_cfg.model,
+        })
+    for tile_index, (offset_y, tile_h, tile_img) in enumerate(tiles):
+        t_tile = time.perf_counter()
+        _trace('image.tile.begin', {
+            'index': tile_index,
+            'tiles': len(tiles),
+            'offset_y': offset_y,
+            'tile_h': tile_h,
+        })
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+            t_save = time.perf_counter()
             tile_img.convert("RGB").save(f, format="JPEG", quality=95)
             tmp_tile_path = f.name
+            save_ms = _elapsed_ms(t_save)
         try:
-            res = _process_image_path_single(tmp_tile_path, lang, mode, ai_cfg)
+            res = _process_image_path_single(tmp_tile_path, lang, mode, tile_ai_cfg)
             results.append((offset_y, tile_h, res))
+            _trace('image.tile.done', {
+                'index': tile_index,
+                'tiles': len(tiles),
+                'offset_y': offset_y,
+                'tile_h': tile_h,
+                'save_ms': save_ms,
+                'total_ms': _elapsed_ms(t_tile),
+                'has_original_text': bool(res.get('originalTextFull') if isinstance(res, dict) else ''),
+                'has_ai_text': bool(res.get('AiTextFull') if isinstance(res, dict) else ''),
+            })
         finally:
             try:
                 os.unlink(tmp_tile_path)
@@ -921,6 +1130,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         raise Exception("Failed to process any image tiles")
 
     # Merge results
+    t_merge = time.perf_counter()
     merged = results[0][2].copy()
     
     merged_original_text = []
@@ -988,14 +1198,105 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
     if 'translated' in merged and isinstance(merged['translated'], dict):
         merged['translated']['translatedTree'] = merged_translated_tree
         merged['translated']['translatedTextFull'] = merged['translatedTextFull']
-    if 'Ai' in merged and isinstance(merged['Ai'], dict):
+
+    thai_font = getattr(core, 'FONT_THAI_PATH', 'NotoSansThai-Regular.ttf')
+    latin_font = getattr(core, 'FONT_LATIN_PATH', 'NotoSans-Regular.ttf')
+
+    target_lang = _normalize_lang(lang)
+    if target_lang == 'ja':
+        latin_font = getattr(core, 'FONT_JA_PATH', latin_font)
+    elif target_lang in ('zh', 'zh-hans', 'zh_cn', 'zh-cn', 'zh_hans'):
+        latin_font = getattr(core, 'FONT_ZH_SC_PATH', latin_font)
+    elif target_lang in ('zh-hant', 'zh_tw', 'zh-tw', 'zh_hant'):
+        latin_font = getattr(core, 'FONT_ZH_TC_PATH', latin_font)
+
+    if ai_cfg and str(mode or '').strip() == 'lens_text' and getattr(core, 'DO_AI', True):
+        t_ai_batch = time.perf_counter()
+        src_paras = _tree_to_paragraph_texts(merged_original_tree)
+        src_text = _apply_para_markers(src_paras) if src_paras else ''
+        _trace('image.split.ai_batch.begin', {
+            'tiles': len(results),
+            'paras': len(src_paras),
+            'input_len': len(src_text),
+            'provider': ai_cfg.provider,
+            'model': ai_cfg.model,
+        })
+        if _has_meaningful_text(src_text):
+            ai = ai_translate_text(src_text, target_lang, ai_cfg)
+            if src_paras and _needs_ai_retry(str(ai.get('aiTextFull') or ''), len(src_paras)):
+                _trace('image.split.ai_batch.retry.begin', {
+                    'expected_paras': len(src_paras),
+                    'found_markers': len(_extract_marker_indices(str(ai.get('aiTextFull') or ''))),
+                })
+                t_retry = time.perf_counter()
+                retry_paras = [_clamp_runaway_repeats(p) for p in src_paras]
+                retry_text = _apply_para_markers(retry_paras) or src_text
+                ai = ai_translate_text(retry_text, target_lang, ai_cfg, is_retry=True)
+                _trace('image.split.ai_batch.retry.done', {
+                    'ms': _elapsed_ms(t_retry),
+                    'found_markers': len(_extract_marker_indices(str(ai.get('aiTextFull') or ''))),
+                })
+
+            ai_text_full = str(ai.get('aiTextFull') or '')
+            meta0 = ai.get('meta') or {}
+            expected = len(src_paras)
+            if expected and not _has_complete_marker_sequence(ai_text_full, expected):
+                fallback_paras = _tree_to_paragraph_texts(merged_translated_tree)
+                if len(fallback_paras) < expected:
+                    fallback_paras = (fallback_paras + src_paras)[:expected]
+                else:
+                    fallback_paras = fallback_paras[:expected]
+                ai_text_full, repair_meta = _repair_marked_ai_text(
+                    ai_text_full, expected, fallback_paras)
+                meta0 = {**meta0, **repair_meta}
+                _trace('image.split.ai_batch.marker_repaired', repair_meta)
+
+            template_tree = merged_original_tree if (merged_original_tree.get('paragraphs') or []) else merged_translated_tree
+            t_patch = time.perf_counter()
+            patched = core.patch(
+                {'Ai': {'aiTextFull': ai_text_full, 'aiTree': template_tree}},
+                W,
+                H,
+                thai_font or '',
+                latin_font or '',
+                lang=target_lang,
+            )
+            merged_ai_tree = (patched.get('Ai') or {}).get('aiTree') or {}
+            merged_ai_text = [ai_text_full] if ai_text_full else []
+            merged['AiTextFull'] = ai_text_full
+            merged['Ai'] = {
+                'aiTextFull': ai_text_full,
+                'aiTree': merged_ai_tree,
+                'meta': {
+                    **meta0,
+                    'batched_tiles': len(results),
+                    'batched_paras': len(src_paras),
+                },
+            }
+            _trace('image.split.ai_batch.patch_done', {
+                'ms': _elapsed_ms(t_patch),
+                'stats_ai': _tree_stats(merged_ai_tree),
+            })
+        else:
+            merged['AiTextFull'] = ''
+            merged['Ai'] = {
+                'meta': {
+                    'skipped': True,
+                    'skipped_reason': 'no_text',
+                    'batched_tiles': len(results),
+                }
+            }
+        _trace('image.split.ai_batch.done', {
+            'ms': _elapsed_ms(t_ai_batch),
+            'has_ai_text': bool(merged.get('AiTextFull')),
+        })
+
+    if 'Ai' in merged and isinstance(merged['Ai'], dict) and not (ai_cfg and str(mode or '').strip() == 'lens_text'):
         merged['Ai']['aiTree'] = merged_ai_tree
         merged['Ai']['aiTextFull'] = merged['AiTextFull']
         merged['Ai']['meta'] = results[-1][2].get('Ai', {}).get('meta', {}) # Give meta from last tile
 
     # Re-generate HTML
-    thai_font = getattr(core, 'FONT_THAI_PATH', 'NotoSansThai-Regular.ttf')
-    latin_font = getattr(core, 'FONT_LATIN_PATH', 'NotoSans-Regular.ttf')
 
     # Regenerate translated HTML if present
     if merged.get('translated') and getattr(core, 'DO_TRANSLATED_HTML', True):
@@ -1015,12 +1316,19 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
 
     # Combine rendered images
     if merged_images:
+        t_combine = time.perf_counter()
         final_img = core.Image.new("RGB", (W, H))
         for y, chunk_img in merged_images:
             final_img.paste(chunk_img, (0, y))
         buf = io.BytesIO()
         final_img.save(buf, format="PNG")
         merged['imageDataUri'] = _bytes_to_datauri(buf.getvalue(), "image/png")
+        _trace('image.merge.stage', {
+            'stage': 'combine_images',
+            'ms': _elapsed_ms(t_combine),
+            'chunks': len(merged_images),
+            'datauri_len': len(str(merged.get('imageDataUri') or '')),
+        })
 
     # htmlMeta fixes
     merged['htmlMeta'] = {
@@ -1028,6 +1336,14 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         'baseH': int(H),
         'format': 'tp',
     }
+    _trace('image.merge.done', {
+        'tiles': len(results),
+        'merge_ms': _elapsed_ms(t_merge),
+        'total_ms': _elapsed_ms(t_total),
+        'original_text_len': len(merged.get('originalTextFull') or ''),
+        'translated_text_len': len(merged.get('translatedTextFull') or ''),
+        'ai_text_len': len(merged.get('AiTextFull') or ''),
+    })
     
     return merged
 

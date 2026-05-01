@@ -59,8 +59,8 @@ DRAW_OUTLINE_PARA = False
 DRAW_OUTLINE_ITEM = False
 AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "4"))
 _ai_semaphore = threading.Semaphore(AI_MAX_CONCURRENCY)
-CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "10")))
-CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "120")))
+CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "3")))
+CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "900")))
 _cli_semaphore = threading.Semaphore(CLI_MAX_CONCURRENCY)
 
 DRAW_OUTLINE_SPAN = False
@@ -432,12 +432,9 @@ AI_MODEL_ALIASES = {
 
 CLI_GEMINI_MODELS = [
     "auto",
-    "pro",
-    "flash",
-    "flash-lite",
     "gemini-3.1-pro-preview",
-    "gemini-3-pro-preview",
     "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",

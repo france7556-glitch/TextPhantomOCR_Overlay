@@ -142,12 +142,9 @@ const RETRY_DELAYS_MS = [600, 1200, 2500, 5000];
 
 const CLI_GEMINI_MODELS = [
   "auto",
-  "pro",
-  "flash",
-  "flash-lite",
   "gemini-3.1-pro-preview",
-  "gemini-3-pro-preview",
   "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite-preview",
   "gemini-2.5-pro",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
