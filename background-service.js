@@ -615,6 +615,21 @@ async function fetchImageDataUriFromUrl(url, pageUrl) {
   return await blobToDataUri(blob, mime || blob.type);
 }
 
+async function fetchImageDataUriFromPage(tabId, frameId, src) {
+  if (!tabId || !src) return "";
+  const resp = await requestFromTabEnsured(
+    tabId,
+    { type: "GET_IMAGE_DATA_URI", src },
+    frameId,
+  );
+  const dataUri = String(resp?.dataUri || "");
+  if (!resp?.ok || !dataUri.startsWith("data:image/")) return "";
+  if (dataUri.length < 128) return "";
+  if (dataUri.length > 34 * 1024 * 1024)
+    throw new Error("[download] Image too large");
+  return dataUri;
+}
+
 function _detectStage(msg) {
   const m = String(msg || "");
   if (m.startsWith("[download]") || m.includes("[download]")) return "download";
@@ -1697,7 +1712,30 @@ async function processJob(payload, tabId, frameId = 0) {
           err: msg,
           permanent: !!cls?.permanent,
         });
-        if (cls?.permanent) {
+        try {
+          const du = await fetchImageDataUriFromPage(tabId, frameId, src);
+          if (du) {
+            payload.imageDataUri = du;
+            if (key) mdDataUriCache.set(key, { du, ts: Date.now() });
+            const meta =
+              payload.metadata && typeof payload.metadata === "object"
+                ? payload.metadata
+                : (payload.metadata = {});
+            const pipe = Array.isArray(meta.pipeline) ? meta.pipeline : [];
+            meta.pipeline = pipe.concat({
+              stage: "page_datauri_fallback",
+              at: new Date().toISOString(),
+            });
+            meta.timestamp = new Date().toISOString();
+            if (batch && imageKey) batchMark(batchId, imageKey, { payload });
+            ev("image.datauri.page_fallback.ok", { size: du.length });
+          }
+        } catch (fallbackErr) {
+          evWarn("image.datauri.page_fallback.fail", {
+            err: fallbackErr?.message || String(fallbackErr),
+          });
+        }
+        if (!payload?.imageDataUri && cls?.permanent) {
           if (payload?.metadata?.image_id)
             pendingByImage.delete(payload.metadata.image_id);
           if (batch && imageKey) {

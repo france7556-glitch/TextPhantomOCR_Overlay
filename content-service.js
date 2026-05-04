@@ -441,7 +441,12 @@
     } catch {}
 
     try {
-      const res = await fetch(src, { cache: "force-cache" });
+      const res = await fetch(src, {
+        cache: "force-cache",
+        credentials: "include",
+        referrer: location.href,
+      });
+      if (!res.ok) return "";
       const blob = await res.blob();
       const du = await blobToDataUri(blob);
       if (du) return du;
@@ -2187,6 +2192,14 @@
             )
           : null;
         sendResp({ ok: Boolean(payload), payload });
+        return;
+      }
+
+      if (msg.type === "GET_IMAGE_DATA_URI") {
+        const src = _normUrl(msg.src || "");
+        const img = src ? findTargetImage(src) : null;
+        const dataUri = img ? await getImageDataUriFromElement(img) : "";
+        sendResp({ ok: Boolean(dataUri), dataUri });
         return;
       }
 
