@@ -35,6 +35,7 @@ const WARMUP_PATH = "/warmup";
 const WARMUP_TIMEOUT_MS = 2500;
 const WARMUP_TTL_MS = 20 * 60 * 1000;
 
+const CLI_MAX_CONCURRENCY = 10;
 const SOFT_MAX_CONCURRENCY_DEFAULT = 15;
 
 let MAX_CONCURRENCY = 10;
@@ -103,7 +104,7 @@ function aiSoftMaxConcurrencyFromKey(key) {
 }
 
 function softConcurrencyForSource(source, aiKey) {
-  if (isCliSource(source)) return 3;
+  if (isCliSource(source)) return 5;
   return aiSoftMaxConcurrencyFromKey(aiKey);
 }
 
@@ -1538,42 +1539,63 @@ async function handleResult(jobId, result) {
     batchUpdateToast(batch, "แทรกกลับ");
   }
 
-  let replaceResp = null;
-  if (newImg && mode !== "lens_text") {
-    ev("job.result.image", { id: jobId });
-    replaceResp = await requestFromTabEnsured(
-      tabId,
-      { type: "REPLACE_IMAGE", original: imgUrl, newSrc: newImg },
-      frameId,
-    );
-  }
+  const DOM_INSERT_MAX_RETRIES = 3;
+  const DOM_INSERT_RETRY_DELAY_MS = 2500;
 
+  let replaceApplied = false;
+  let overlayApplied = false;
+  let replaceResp = null;
   let overlayResp = null;
-  if (hasHtml) {
-    ev("job.result.html", { id: jobId });
-    overlayResp = await requestFromTabEnsured(
-      tabId,
-      {
-        type: "OVERLAY_HTML",
-        original: imgUrl,
-        result,
-        mode: mode || "",
-        source: ctx?.source || "",
-      },
-      frameId,
-    );
+  const needReplace = !!(newImg && mode !== "lens_text");
+  const needOverlay = !!hasHtml;
+
+  for (let attempt = 0; attempt < DOM_INSERT_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      ev("job.result.dom_retry", { id: jobId, attempt, replaceApplied, overlayApplied });
+      if (batch) batchUpdateToast(batch, `แทรกกลับ (ลองครั้งที่ ${attempt + 1})`);
+      await new Promise((r) => setTimeout(r, DOM_INSERT_RETRY_DELAY_MS));
+    }
+
+    if (needReplace && !replaceApplied) {
+      ev("job.result.image", { id: jobId, attempt });
+      replaceResp = await requestFromTabEnsured(
+        tabId,
+        { type: "REPLACE_IMAGE", original: imgUrl, newSrc: newImg },
+        frameId,
+      );
+      if (replaceResp?.applied) replaceApplied = true;
+    }
+
+    if (needOverlay && !overlayApplied) {
+      ev("job.result.html", { id: jobId, attempt });
+      overlayResp = await requestFromTabEnsured(
+        tabId,
+        {
+          type: "OVERLAY_HTML",
+          original: imgUrl,
+          result,
+          mode: mode || "",
+          source: ctx?.source || "",
+        },
+        frameId,
+      );
+      if (overlayResp?.applied) overlayApplied = true;
+    }
+
+    const allDone = (!needReplace || replaceApplied) && (!needOverlay || overlayApplied);
+    if (allDone) break;
   }
 
   let ok = true;
   let errMsg = "";
-  if (!hasHtml && !(newImg && mode !== "lens_text")) ok = false;
-  if (newImg && mode !== "lens_text" && !replaceResp?.ok) {
+  if (!needReplace && !needOverlay) ok = false;
+  if (needReplace && !replaceApplied) {
     ok = false;
     errMsg = "DOM replace failed";
   }
-  if (hasHtml && !overlayResp?.ok) {
+  if (needOverlay && !overlayApplied) {
     ok = false;
-    errMsg = "Overlay insert failed";
+    errMsg = errMsg ? errMsg + " + Overlay insert failed" : "Overlay insert failed";
   }
 
   if (!hasHtml) {

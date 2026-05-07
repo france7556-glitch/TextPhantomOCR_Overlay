@@ -2242,6 +2242,7 @@
       }
 
       if (msg.type === "OVERLAY_HTML") {
+        let applied = false;
         try {
           const mode = typeof msg?.mode === "string" ? msg.mode : "";
           if (!mode) {
@@ -2268,6 +2269,7 @@
 
           if (img) {
             applyHtmlOverlay(img, msg.result, source, isText, msg.original);
+            applied = true;
             log.info("OVERLAY_HTML applied", {
               original: truncate(msg.original),
             });
@@ -2275,11 +2277,15 @@
             mdRememberPending(msg.original, {
               overlay: { result: msg.result, source, isTextMode: isText },
             });
+          } else {
+            log.warn("OVERLAY_HTML target not found", {
+              original: truncate(msg.original),
+            });
           }
         } catch (e) {
           console.warn("[LensOCR content] OVERLAY_HTML failed", e);
         }
-        sendResp({ ok: true });
+        sendResp({ ok: true, applied });
         return;
       }
       sendResp({ ok: true, ignored: true });

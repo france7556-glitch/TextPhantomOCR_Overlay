@@ -59,8 +59,9 @@ DRAW_OUTLINE_PARA = False
 DRAW_OUTLINE_ITEM = False
 AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "4"))
 _ai_semaphore = threading.Semaphore(AI_MAX_CONCURRENCY)
-CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "3")))
-CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "900")))
+CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "10")))
+CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "230")))
+CLI_IDLE_TIMEOUT_SEC = max(10.0, float(os.getenv("TP_CLI_IDLE_TIMEOUT_SEC", "90")))
 _cli_semaphore = threading.Semaphore(CLI_MAX_CONCURRENCY)
 
 DRAW_OUTLINE_SPAN = False
@@ -549,7 +550,7 @@ AI_PROMPT_DATA_TEMPLATE_TEXT = (
     "Return the translation as plain text only."
 )
 
-FIREBASE_COOKIE_TTL_SEC = int(os.getenv("FIREBASE_COOKIE_TTL_SEC", "900"))
+FIREBASE_COOKIE_TTL_SEC = int(os.getenv("FIREBASE_COOKIE_TTL_SEC", "230"))
 _FIREBASE_COOKIE_CACHE = {"ts": 0.0, "url": "", "data": None}
 _FONT_RESOLVE_CACHE = {}
 _HF_MODELS_CACHE = {}
@@ -757,7 +758,7 @@ def _short_gemini_cli_error(detail: str) -> str:
         return f"Gemini CLI usage limit reached.{retry}"
     return text[:500]
 
-def _cli_gemini_generate_json(system_text: str, user_parts: list[str], model: str = "auto") -> str:
+def _cli_gemini_generate_json(system_text: str, user_parts: list[str], model: str = "auto", is_retry: bool = False) -> str:
     import subprocess, shutil
     text_parts = []
     for p in user_parts:
@@ -831,7 +832,7 @@ def _short_codex_cli_error(detail: str) -> str:
         return f"Codex CLI usage limit reached.{retry}"
     return text[:500]
 
-def _cli_codex_generate_json(system_text: str, user_parts: list[str], model: str = "auto", reasoning_effort: str = "medium") -> str:
+def _cli_codex_generate_json(system_text: str, user_parts: list[str], model: str = "auto", reasoning_effort: str = "medium", is_retry: bool = False) -> str:
     import subprocess, shutil, tempfile
     prompt_parts = [system_text]
     for p in user_parts:
@@ -1004,18 +1005,95 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         f"[TextPhantom][trace] cli.{tool_name}.spawn pid={proc.pid} cwd={cwd!r}",
         flush=True,
     )
+
+    # --- Idle-detection: read stdout/stderr in threads, track last activity ---
+    idle_timeout = float(CLI_IDLE_TIMEOUT_SEC)
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    last_activity = [time.time()]  # mutable ref for threads
+    read_done = threading.Event()
+
+    def _reader(stream, buf: list[str]):
+        """Read stream line-by-line, update last_activity on each line."""
+        try:
+            for line in stream:
+                buf.append(line)
+                last_activity[0] = time.time()
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, stdout_chunks), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, stderr_chunks), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    if stdin_mode == subprocess.PIPE and proc.stdin:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+    start_time = time.time()
+    killed_reason = ""
     try:
-        if stdin_mode == subprocess.PIPE:
-            stdout, stderr = proc.communicate(input="", timeout=timeout_sec)
-        else:
-            stdout, stderr = proc.communicate(timeout=timeout_sec)
+        while True:
+            # Check if process finished
+            ret = proc.poll()
+            if ret is not None:
+                break
+
+            elapsed = time.time() - start_time
+            idle_elapsed = time.time() - last_activity[0]
+
+            # Hard timeout
+            if elapsed > timeout_sec:
+                killed_reason = f"timeout ({timeout_sec:.0f}s)"
+                print(
+                    f"[TextPhantom][trace] cli.{tool_name}.kill reason=hard_timeout elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+                _kill_process_tree(proc.pid)
+                break
+
+            # Idle timeout — no output for too long, likely hung
+            if idle_elapsed > idle_timeout:
+                killed_reason = f"idle_timeout ({idle_timeout:.0f}s no output)"
+                print(
+                    f"[TextPhantom][trace] cli.{tool_name}.kill reason=idle_timeout idle={idle_elapsed:.1f}s elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+                _kill_process_tree(proc.pid)
+                break
+
+            # Sleep briefly before checking again
+            time.sleep(0.5)
+
+        # Wait for reader threads to finish (they'll end when pipes close)
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
+
+        if killed_reason:
+            raise subprocess.TimeoutExpired(
+                cmd, timeout_sec, output=stdout, stderr=stderr
+            )
+
         return _CliResult(proc.returncode, stdout or "", stderr or "")
     except subprocess.TimeoutExpired:
+        raise
+    except Exception:
         _kill_process_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except Exception:
-            stdout, stderr = "", ""
+        t_out.join(timeout=3)
+        t_err.join(timeout=3)
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
         raise subprocess.TimeoutExpired(cmd, timeout_sec, output=stdout, stderr=stderr)
 
 def _kill_process_tree(pid: int) -> None:

@@ -250,8 +250,13 @@ def _needs_ai_retry(ai_text_full: str, expected_paras: int) -> bool:
     if len(idx) >= expected_paras:
         return False
 
-    if (TP_PARA_MARKER_PREFIX in (ai_text_full or '')) and (TP_PARA_MARKER_SUFFIX not in (ai_text_full or '')):
-        return True
+    # Only retry if we got 0 markers (AI completely ignored marker format).
+    # If we got at least 1 marker, let the repair mechanism fill in
+    # missing paragraphs with translated text — much faster than a full
+    # CLI retry which can take 45-70s.
+    if len(idx) > 0:
+        return False
+
     return True
 
 def _marker_segment_map(ai_text_full: str, expected: int) -> Dict[int, str]:
@@ -586,13 +591,13 @@ def _is_cli_retryable_error(e: Exception) -> bool:
     )
     return any(x in msg for x in retryable)
 
-def _generate_ai_raw(provider: str, api_key: str, base_url: str, model: str, system_text: str, user_parts: List[str], ai: AiConfig):
+def _generate_ai_raw(provider: str, api_key: str, base_url: str, model: str, system_text: str, user_parts: List[str], ai: AiConfig, is_retry: bool = False):
     if provider == 'cli_gemini':
-        raw = core._cli_gemini_generate_json(system_text, user_parts, model)
+        raw = core._cli_gemini_generate_json(system_text, user_parts, model, is_retry=is_retry)
         return raw, model
     if provider == 'cli_codex':
         raw = core._cli_codex_generate_json(
-            system_text, user_parts, model, ai.reasoning_effort)
+            system_text, user_parts, model, ai.reasoning_effort, is_retry=is_retry)
         return raw, model
     if provider == 'gemini':
         raw = core._gemini_generate_json(
@@ -662,7 +667,7 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
     cli_provider = provider in ('cli_gemini', 'cli_codex')
     try:
         raw, used_model = _generate_ai_raw(
-            provider, api_key, base_url, model, system_text, user_parts, ai)
+            provider, api_key, base_url, model, system_text, user_parts, ai, is_retry=is_retry)
     except Exception as e:
         if not cli_provider or not _is_cli_retryable_error(e):
             raise
@@ -673,7 +678,7 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         })
         time.sleep(1.5)
         raw, used_model = _generate_ai_raw(
-            provider, api_key, base_url, model, system_text, user_parts, ai)
+            provider, api_key, base_url, model, system_text, user_parts, ai, is_retry=True)
         _trace('ai.retry.done', {
             'provider': provider,
             'model': used_model,
@@ -959,46 +964,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
             if src_paras:
                 expected = len(src_paras)
                 if not _has_complete_marker_sequence(ai_text_full, expected):
-                    fallback_paras = _tree_to_paragraph_texts(translated_tree or {})
-                    if len(fallback_paras) < expected:
-                        fallback_paras = (fallback_paras + src_paras)[:expected]
-                    else:
-                        fallback_paras = fallback_paras[:expected]
-
-                    found = sorted(_extract_marker_indices(ai_text_full))
-                    seg_map: Dict[int, str] = {}
-                    for idx in found:
-                        if idx < 0 or idx >= expected:
-                            continue
-                        marker = f"<<TP_P{idx}>>"
-                        m = re.search(rf"{re.escape(marker)}\s*([\s\S]*?)(?=<<TP_P\d+>>|\Z)", ai_text_full)
-                        seg = _collapse_ws(m.group(1) if m else '')
-                        if seg and idx not in seg_map:
-                            seg_map[idx] = seg
-
-                    missing = 0
-                    out_lines: List[str] = []
-                    for i in range(expected):
-                        seg = seg_map.get(i) or _collapse_ws(fallback_paras[i] if i < len(fallback_paras) else '')
-                        if not seg_map.get(i):
-                            missing += 1
-                        out_lines.append(f"<<TP_P{i}>>")
-                        out_lines.append(seg)
-                        out_lines.append('')
-                    ai_text_full = "\n".join(out_lines).strip("\n")
-                    _dbg('ai.marker.repaired', {
-                        'expected_paras': expected,
-                        'found_markers': len(seg_map),
-                        'missing': missing,
-                    })
-
-                    meta0 = {
-                        **meta0,
-                        'marker_repaired': True,
-                        'marker_expected': expected,
-                        'marker_found': len(seg_map),
-                        'marker_missing': missing,
-                    }
+                    raise Exception('ai returned incomplete translation (missing text markers)')
 
             template_tree = _pick_ai_template_tree()
             _dbg('ai.template.pick', {
@@ -1388,15 +1354,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
             meta0 = ai.get('meta') or {}
             expected = len(src_paras)
             if expected and not _has_complete_marker_sequence(ai_text_full, expected):
-                fallback_paras = _tree_to_paragraph_texts(merged_translated_tree)
-                if len(fallback_paras) < expected:
-                    fallback_paras = (fallback_paras + src_paras)[:expected]
-                else:
-                    fallback_paras = fallback_paras[:expected]
-                ai_text_full, repair_meta = _repair_marked_ai_text(
-                    ai_text_full, expected, fallback_paras)
-                meta0 = {**meta0, **repair_meta}
-                _trace('image.split.ai_batch.marker_repaired', repair_meta)
+                raise Exception('ai returned incomplete translation (missing text markers)')
 
             template_tree = merged_original_tree if (merged_original_tree.get('paragraphs') or []) else merged_translated_tree
             t_patch = time.perf_counter()
