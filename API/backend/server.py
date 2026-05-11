@@ -1,4 +1,4 @@
-import asyncio, base64, contextvars, copy, hashlib, io, json, os, re, tempfile, time, uuid, httpx, logging
+import asyncio, base64, contextvars, copy, difflib, hashlib, io, json, os, re, tempfile, time, uuid, httpx, logging
 
 from backend import lens_core as core
 from http import HTTPStatus
@@ -32,6 +32,11 @@ TP_TILE_SEAM_SEARCH_PX = max(
     0, int(os.environ.get('TP_TILE_SEAM_SEARCH_PX', '700')))
 TP_TILE_SEAM_BAND_PX = max(
     8, int(os.environ.get('TP_TILE_SEAM_BAND_PX', '64')))
+TP_TILE_OVERLAP_PX = max(0, int(os.environ.get('TP_TILE_OVERLAP_PX', '180')))
+TP_TILE_DEDUPE_IOU = max(
+    0.0, float(os.environ.get('TP_TILE_DEDUPE_IOU', '0.35')))
+TP_TILE_DEDUPE_TEXT_SIM = max(
+    0.0, float(os.environ.get('TP_TILE_DEDUPE_TEXT_SIM', '0.78')))
 
 _result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _ai_result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -1252,8 +1257,156 @@ def _build_vertical_tiles(img, max_h: int):
                 cut_y = target_y
         tile_h = cut_y - y
         tiles.append((y, tile_h, img.crop((0, y, W, cut_y))))
-        y = cut_y
+        if cut_y >= H:
+            break
+        overlap = min(TP_TILE_OVERLAP_PX, max(0, tile_h - TP_TILE_MIN_H))
+        next_y = max(y + 1, cut_y - overlap)
+        y = next_y
     return tiles
+
+def _norm_dedupe_text(text: str) -> str:
+    t = _tp_marker_re.sub('', str(text or '')).lower()
+    return re.sub(r'\s+', ' ', t).strip()
+
+def _para_text(p: dict) -> str:
+    if not isinstance(p, dict):
+        return ''
+    t = str(p.get('text') or '').strip()
+    if t:
+        return t
+    parts: List[str] = []
+    for it in (p.get('items') or []):
+        if not isinstance(it, dict):
+            continue
+        s = str(it.get('text') or '').strip()
+        if s:
+            parts.append(s)
+    return ' '.join(parts).strip()
+
+def _box_from_norm(box: dict, W: int, H: int):
+    if not isinstance(box, dict):
+        return None
+    try:
+        l = float(box.get('left') or 0.0) * float(W)
+        t = float(box.get('top') or 0.0) * float(H)
+        r = l + max(0.0, float(box.get('width') or 0.0) * float(W))
+        b = t + max(0.0, float(box.get('height') or 0.0) * float(H))
+        if r <= l or b <= t:
+            return None
+        return (l, t, r, b)
+    except Exception:
+        return None
+
+def _para_bbox_px(p: dict, W: int, H: int):
+    if not isinstance(p, dict):
+        return None
+    bpx = p.get('bounds_px')
+    if isinstance(bpx, (list, tuple)) and len(bpx) == 4:
+        try:
+            l, t, r, b = [float(v) for v in bpx]
+            if r > l and b > t:
+                return (l, t, r, b)
+        except Exception:
+            pass
+
+    boxes = []
+    for it in (p.get('items') or []):
+        if not isinstance(it, dict):
+            continue
+        bb = _box_from_norm(it.get('box'), W, H)
+        if bb:
+            boxes.append(bb)
+        for sp in (it.get('spans') or []):
+            if not isinstance(sp, dict):
+                continue
+            bb = _box_from_norm(sp.get('box'), W, H)
+            if bb:
+                boxes.append(bb)
+    if not boxes:
+        return None
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+def _bbox_iou(a, b) -> float:
+    if not a or not b:
+        return 0.0
+    l = max(a[0], b[0])
+    t = max(a[1], b[1])
+    r = min(a[2], b[2])
+    bb = min(a[3], b[3])
+    iw = max(0.0, r - l)
+    ih = max(0.0, bb - t)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    ba = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    denom = aa + ba - inter
+    return inter / denom if denom > 0.0 else 0.0
+
+def _bbox_center_y(b) -> float:
+    return (float(b[1]) + float(b[3])) / 2.0 if b else 0.0
+
+def _looks_duplicate_para(a: dict, b: dict, W: int, H: int) -> bool:
+    ab = _para_bbox_px(a, W, H)
+    bb = _para_bbox_px(b, W, H)
+    at = _norm_dedupe_text(_para_text(a))
+    bt = _norm_dedupe_text(_para_text(b))
+    if not ab or not bb:
+        return bool(at and bt and at == bt)
+
+    iou = _bbox_iou(ab, bb)
+    if iou >= TP_TILE_DEDUPE_IOU:
+        return True
+
+    if not at or not bt:
+        return False
+    text_sim = difflib.SequenceMatcher(None, at, bt).ratio()
+    if text_sim < TP_TILE_DEDUPE_TEXT_SIM:
+        return False
+
+    ah = max(1.0, ab[3] - ab[1])
+    bh = max(1.0, bb[3] - bb[1])
+    max_center_delta = max(18.0, min(120.0, (ah + bh) * 0.75))
+    return abs(_bbox_center_y(ab) - _bbox_center_y(bb)) <= max_center_delta
+
+def _reindex_tree_paragraphs(tree: dict) -> None:
+    if not isinstance(tree, dict):
+        return
+    for idx, p in enumerate(tree.get('paragraphs') or []):
+        if not isinstance(p, dict):
+            continue
+        p['para_index'] = idx
+        for it in (p.get('items') or []):
+            if not isinstance(it, dict):
+                continue
+            it['para_index'] = idx
+            for sp in (it.get('spans') or []):
+                if isinstance(sp, dict):
+                    sp['para_index'] = idx
+
+def _dedupe_tree_paragraphs(tree: dict, W: int, H: int) -> dict:
+    if not isinstance(tree, dict):
+        return {'removed': 0}
+    paras = [p for p in (tree.get('paragraphs') or []) if isinstance(p, dict)]
+    if len(paras) <= 1:
+        _reindex_tree_paragraphs(tree)
+        return {'removed': 0}
+
+    kept: List[dict] = []
+    removed = 0
+    for p in sorted(paras, key=lambda x: (_bbox_center_y(_para_bbox_px(x, W, H)), _norm_dedupe_text(_para_text(x)))):
+        if any(_looks_duplicate_para(p, k, W, H) for k in kept[-8:]):
+            removed += 1
+            continue
+        kept.append(p)
+    tree['paragraphs'] = kept
+    _reindex_tree_paragraphs(tree)
+    return {'removed': removed}
 
 def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
     t_total = time.perf_counter()
@@ -1276,6 +1429,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         'w': W,
         'h': H,
         'max_h': MAX_H,
+        'overlap_px': TP_TILE_OVERLAP_PX,
         'mode': mode,
         'ai': bool(ai_cfg),
     })
@@ -1333,27 +1487,25 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
     t_merge = time.perf_counter()
     merged = results[0][2].copy()
     
-    merged_original_text = []
-    merged_translated_text = []
-    merged_ai_text = []
-    
     merged_original_tree = {"side": "original", "paragraphs": []}
     merged_translated_tree = {"side": "translated", "paragraphs": []}
     merged_ai_tree = {"side": "Ai", "paragraphs": []}
+    raw_original_text = []
+    raw_translated_text = []
+    raw_ai_text = []
     
     merged_images = []
     
     para_idx_offset = {"original": 0, "translated": 0, "Ai": 0}
 
     for offset_y, tile_h, res in results:
-        # Merge texts
         if res.get('originalTextFull'):
-            merged_original_text.append(res['originalTextFull'].strip())
+            raw_original_text.append(str(res['originalTextFull']).strip())
         if res.get('translatedTextFull'):
-            merged_translated_text.append(res['translatedTextFull'].strip())
+            raw_translated_text.append(str(res['translatedTextFull']).strip())
         if res.get('AiTextFull'):
-            merged_ai_text.append(res['AiTextFull'].strip())
-            
+            raw_ai_text.append(str(res['AiTextFull']).strip())
+
         # Shift and merge trees
         for tree_key, result_tree_key, role in [
             ('original', 'originalTree', 'original'),
@@ -1387,6 +1539,30 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
             img_bytes, _ = _datauri_to_bytes(uri)
             chunk_img = core.Image.open(io.BytesIO(img_bytes)).convert("RGB")
             merged_images.append((offset_y, chunk_img))
+
+    dedupe_meta = {
+        'original': _dedupe_tree_paragraphs(merged_original_tree, W, H),
+        'translated': _dedupe_tree_paragraphs(merged_translated_tree, W, H),
+        'Ai': _dedupe_tree_paragraphs(merged_ai_tree, W, H),
+    }
+    _trace('image.merge.dedupe', dedupe_meta)
+    merged['splitMeta'] = {
+        'split': True,
+        'max_h': int(MAX_H),
+        'overlap_px': int(TP_TILE_OVERLAP_PX),
+        'tiles': [{'y': int(y), 'h': int(h)} for y, h, _ in tiles],
+        'dedupe': dedupe_meta,
+    }
+
+    merged_original_text = _tree_to_paragraph_texts(merged_original_tree)
+    merged_translated_text = _tree_to_paragraph_texts(merged_translated_tree)
+    merged_ai_text = _tree_to_paragraph_texts(merged_ai_tree)
+    if not merged_original_text:
+        merged_original_text = raw_original_text
+    if not merged_translated_text:
+        merged_translated_text = raw_translated_text
+    if not merged_ai_text:
+        merged_ai_text = raw_ai_text
 
     merged['originalTextFull'] = "\n\n".join(merged_original_text)
     merged['translatedTextFull'] = "\n\n".join(merged_translated_text)
