@@ -26,6 +26,12 @@ TP_PARA_MARKER_SUFFIX = '>>'
 TP_RESULT_CACHE_MAX = int(os.environ.get('TP_RESULT_CACHE_MAX', '24'))
 TP_AI_RESULT_CACHE_MAX = int(os.environ.get('TP_AI_RESULT_CACHE_MAX', '16'))
 TP_WARMUP_LANG = (os.environ.get('TP_WARMUP_LANG', 'th') or 'th').strip()
+TP_TILE_MAX_H = max(800, int(os.environ.get('TP_TILE_MAX_H', '3000')))
+TP_TILE_MIN_H = max(300, int(os.environ.get('TP_TILE_MIN_H', '1200')))
+TP_TILE_SEAM_SEARCH_PX = max(
+    0, int(os.environ.get('TP_TILE_SEAM_SEARCH_PX', '700')))
+TP_TILE_SEAM_BAND_PX = max(
+    8, int(os.environ.get('TP_TILE_SEAM_BAND_PX', '64')))
 
 _result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _ai_result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -1162,11 +1168,98 @@ def _shift_tree_y(tree: dict, offset_y_px: int, total_h_px: int, tile_h_px: int)
                         old_cy_px = sb['center']['y'] * tile_h_px
                         sb['center']['y'] = (old_cy_px + offset_y_px) / total_h_px
 
+def _rolling_mean(values, radius: int):
+    np = core.np
+    vals = np.asarray(values, dtype=np.float32)
+    if vals.size == 0:
+        return vals
+    r = max(1, int(radius))
+    padded = np.pad(vals, (r, r), mode='edge')
+    cs = np.concatenate([[0.0], np.cumsum(padded, dtype=np.float64)])
+    window = (2 * r) + 1
+    return ((cs[window:] - cs[:-window]) / float(window)).astype(np.float32)
+
+def _image_row_detail_scores(img) -> Optional["core.np.ndarray"]:
+    try:
+        np = core.np
+        gray = img.convert('L')
+        w, h = gray.size
+        if w > 640:
+            resample = getattr(
+                getattr(core.Image, 'Resampling', core.Image), 'BILINEAR')
+            gray = gray.resize((640, h), resample)
+        arr = np.asarray(gray, dtype=np.int16)
+        if arr.ndim != 2 or arr.shape[0] < 4:
+            return None
+
+        dy = np.abs(np.diff(arr, axis=0)).mean(axis=1)
+        dy = np.concatenate([dy[:1], dy])
+        dx = np.abs(np.diff(arr, axis=1)).mean(axis=1)
+        contrast = arr.std(axis=1)
+        dark_or_light = ((arr < 70) | (arr > 245)).mean(axis=1) * 10.0
+        score = dy + (dx * 0.35) + (contrast * 0.08) + dark_or_light
+        return _rolling_mean(score, max(2, TP_TILE_SEAM_BAND_PX // 2))
+    except Exception as e:
+        _dbg('image.split.smart_seam.score_failed', {'err': str(e)[:200]})
+        return None
+
+def _choose_smart_cut_y(row_scores, y0: int, target_y: int, total_h: int) -> int:
+    if row_scores is None or TP_TILE_SEAM_SEARCH_PX <= 0:
+        return target_y
+    np = core.np
+    target_y = int(max(y0 + 1, min(target_y, total_h)))
+    if total_h - y0 <= TP_TILE_MAX_H:
+        return total_h
+
+    lo = max(y0 + min(TP_TILE_MIN_H, max(1, TP_TILE_MAX_H - TP_TILE_SEAM_SEARCH_PX)),
+             target_y - TP_TILE_SEAM_SEARCH_PX)
+    hi = min(target_y, total_h - 1)
+    if hi <= lo:
+        return target_y
+
+    candidates = np.arange(int(lo), int(hi) + 1, dtype=np.int32)
+    local = row_scores[candidates]
+    finite = local[np.isfinite(local)]
+    if finite.size == 0:
+        return target_y
+
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median))) or 1.0
+    norm = (local - median) / mad
+    # Prefer later cuts unless an earlier band is visibly cleaner.
+    distance_penalty = ((target_y - candidates).astype(np.float32) /
+                        float(max(1, TP_TILE_SEAM_SEARCH_PX))) * 0.45
+    ranked = norm + distance_penalty
+    cut_y = int(candidates[int(np.argmin(ranked))])
+    return max(y0 + 1, min(cut_y, target_y))
+
+def _build_vertical_tiles(img, max_h: int):
+    W, H = img.size
+    if H <= max_h:
+        return [(0, H, img)]
+
+    row_scores = _image_row_detail_scores(img)
+    tiles = []
+    y = 0
+    while y < H:
+        remaining = H - y
+        if remaining <= max_h:
+            cut_y = H
+        else:
+            target_y = y + max_h
+            cut_y = _choose_smart_cut_y(row_scores, y, target_y, H)
+            if cut_y <= y:
+                cut_y = target_y
+        tile_h = cut_y - y
+        tiles.append((y, tile_h, img.crop((0, y, W, cut_y))))
+        y = cut_y
+    return tiles
+
 def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
     t_total = time.perf_counter()
     img = core.Image.open(image_path)
     W, H = img.size
-    MAX_H = 3000
+    MAX_H = TP_TILE_MAX_H
     
     if H <= MAX_H:
         out = _process_image_path_single(image_path, lang, mode, ai_cfg)
@@ -1186,16 +1279,10 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         'mode': mode,
         'ai': bool(ai_cfg),
     })
-    tiles = []
-    y = 0
-    while y < H:
-        tile_h = min(MAX_H, H - y)
-        box = (0, y, W, y + tile_h)
-        tile_img = img.crop(box)
-        tiles.append((y, tile_h, tile_img))
-        y += tile_h
+    tiles = _build_vertical_tiles(img, MAX_H)
     _trace('image.split.done', {
         'tiles': len(tiles),
+        'tile_ranges': [{'y': int(y), 'h': int(h)} for y, h, _ in tiles],
         'total_ms': _elapsed_ms(t_total),
     })
 
