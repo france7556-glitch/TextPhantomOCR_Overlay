@@ -1351,6 +1351,18 @@ def _bbox_iou(a, b) -> float:
 def _bbox_center_y(b) -> float:
     return (float(b[1]) + float(b[3])) / 2.0 if b else 0.0
 
+def _text_containment_ratio(shorter: str, longer: str) -> float:
+    """How much of `shorter` is contained within `longer` (0.0 - 1.0)."""
+    if not shorter or not longer:
+        return 0.0
+    if len(shorter) > len(longer):
+        shorter, longer = longer, shorter
+    if shorter in longer:
+        return 1.0
+    sm = difflib.SequenceMatcher(None, shorter, longer)
+    matched_chars = sum(block.size for block in sm.get_matching_blocks())
+    return matched_chars / len(shorter) if len(shorter) > 0 else 0.0
+
 def _looks_duplicate_para(a: dict, b: dict, W: int, H: int) -> bool:
     ab = _para_bbox_px(a, W, H)
     bb = _para_bbox_px(b, W, H)
@@ -1365,6 +1377,20 @@ def _looks_duplicate_para(a: dict, b: dict, W: int, H: int) -> bool:
 
     if not at or not bt:
         return False
+
+    # Text containment check: if the shorter text is mostly contained
+    # in the longer text, they are likely the same paragraph split
+    # across overlapping tiles (one tile got partial, the other got full).
+    shorter, longer = (at, bt) if len(at) <= len(bt) else (bt, at)
+    if len(shorter) >= 4:
+        containment = _text_containment_ratio(shorter, longer)
+        if containment >= 0.70:
+            ah = max(1.0, ab[3] - ab[1])
+            bh = max(1.0, bb[3] - bb[1])
+            max_center_delta = max(18.0, min(200.0, (ah + bh) * 1.0))
+            if abs(_bbox_center_y(ab) - _bbox_center_y(bb)) <= max_center_delta:
+                return True
+
     text_sim = difflib.SequenceMatcher(None, at, bt).ratio()
     if text_sim < TP_TILE_DEDUPE_TEXT_SIM:
         return False
@@ -1400,10 +1426,21 @@ def _dedupe_tree_paragraphs(tree: dict, W: int, H: int) -> dict:
     kept: List[dict] = []
     removed = 0
     for p in sorted(paras, key=lambda x: (_bbox_center_y(_para_bbox_px(x, W, H)), _norm_dedupe_text(_para_text(x)))):
-        if any(_looks_duplicate_para(p, k, W, H) for k in kept[-8:]):
+        dup_idx = None
+        kept_start = max(0, len(kept) - 8)
+        for i in range(kept_start, len(kept)):
+            if _looks_duplicate_para(p, kept[i], W, H):
+                dup_idx = i
+                break
+        if dup_idx is not None:
+            # Keep the paragraph with MORE text (more complete version)
+            existing_text = _norm_dedupe_text(_para_text(kept[dup_idx]))
+            new_text = _norm_dedupe_text(_para_text(p))
+            if len(new_text) > len(existing_text):
+                kept[dup_idx] = p
             removed += 1
-            continue
-        kept.append(p)
+        else:
+            kept.append(p)
     tree['paragraphs'] = kept
     _reindex_tree_paragraphs(tree)
     return {'removed': removed}
@@ -1682,21 +1719,37 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         merged['Ai']['aihtml'] = core.ai_tree_to_tp_html(merged_ai_tree, W, H)
         merged['Ai']['aihtmlMeta'] = {'baseW': int(W), 'baseH': int(H), 'format': 'tp'}
 
-    # Combine rendered images
-    if merged_images:
-        t_combine = time.perf_counter()
-        final_img = core.Image.new("RGB", (W, H))
+    # Re-erase text on FULL original image using merged/deduped OCR spans.
+    # Per-tile erasure can miss text at tile boundaries where a speech bubble
+    # is only partially visible, leaving remnant characters.  Using the
+    # merged original tree (which has complete span boxes from ALL tiles,
+    # shifted to full-image coordinates) ensures every detected text region
+    # is erased cleanly.
+    t_combine = time.perf_counter()
+    merged_spans = core.flatten_tree_spans(merged_original_tree)
+    if merged_spans and getattr(core, 'ERASE_OLD_TEXT_WITH_ORIGINAL_BOXES', True):
+        erased_full = core.erase_text_with_boxes(
+            img.convert('RGB'),
+            merged_spans,
+            pad_px=getattr(core, 'ERASE_PADDING_PX', 2),
+            sample_margin_px=getattr(core, 'ERASE_SAMPLE_MARGIN_PX', 6),
+        )
+    elif merged_images:
+        # Fallback: paste tile-erased images if no merged spans
+        erased_full = core.Image.new("RGB", (W, H))
         for y, chunk_img in merged_images:
-            final_img.paste(chunk_img, (0, y))
-        buf = io.BytesIO()
-        final_img.save(buf, format="PNG")
-        merged['imageDataUri'] = _bytes_to_datauri(buf.getvalue(), "image/png")
-        _trace('image.merge.stage', {
-            'stage': 'combine_images',
-            'ms': _elapsed_ms(t_combine),
-            'chunks': len(merged_images),
-            'datauri_len': len(str(merged.get('imageDataUri') or '')),
-        })
+            erased_full.paste(chunk_img, (0, y))
+    else:
+        erased_full = img.convert('RGB')
+    buf = io.BytesIO()
+    erased_full.save(buf, format="PNG")
+    merged['imageDataUri'] = _bytes_to_datauri(buf.getvalue(), "image/png")
+    _trace('image.merge.stage', {
+        'stage': 'combine_images',
+        'ms': _elapsed_ms(t_combine),
+        'merged_spans': len(merged_spans),
+        'datauri_len': len(str(merged.get('imageDataUri') or '')),
+    })
 
     # htmlMeta fixes
     merged['htmlMeta'] = {
