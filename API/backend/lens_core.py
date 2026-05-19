@@ -551,6 +551,10 @@ AI_PROMPT_DATA_TEMPLATE_TEXT = (
 )
 
 FIREBASE_COOKIE_TTL_SEC = int(os.getenv("FIREBASE_COOKIE_TTL_SEC", "230"))
+LENS_COOKIE_LOCAL_PATH = os.getenv(
+    "LENS_COOKIE_LOCAL_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookie.json"),
+)
 _FIREBASE_COOKIE_CACHE = {"ts": 0.0, "url": "", "data": None}
 _FONT_RESOLVE_CACHE = {}
 _HF_MODELS_CACHE = {}
@@ -4624,14 +4628,47 @@ def get_lens_data_from_image(image_path, firebase_url, lang):
     data = json.loads(j[5:] if j.startswith(")]}'") else j)
     return data
 
+def _load_local_cookie() -> dict | None:
+    """Try to load cookie from local file (API/cookie.json)."""
+    p = LENS_COOKIE_LOCAL_PATH
+    if not p or not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data:
+            return data
+    except Exception:
+        pass
+    return None
+
 def _get_firebase_cookie(firebase_url: str):
+    # --- Priority 1: local cookie file ---
+    local = _load_local_cookie()
+    if local:
+        return local
+
+    # --- Priority 2: Firebase (fallback) ---
     u = (firebase_url or '').strip()
+    if not u:
+        raise Exception(
+            "No cookie available. "
+            "Please run 'python update_cookie.py' in the API folder to set up a local cookie, "
+            "or configure FIREBASE_URL."
+        )
     now = time.time()
     cache = _FIREBASE_COOKIE_CACHE
     if cache.get('data') and cache.get('url') == u and (now - float(cache.get('ts') or 0)) < float(FIREBASE_COOKIE_TTL_SEC):
         return cache.get('data')
     r = httpx.get(u, timeout=30)
+    if r.status_code != 200:
+        raise Exception(f"Firebase cookie fetch failed: HTTP {r.status_code}")
     ck = r.json()
+    if not ck:
+        raise Exception(
+            "Google Lens cookie is null/empty in Firebase DB and no local cookie.json found. "
+            "Please run 'python update_cookie.py' in the API folder to set up a local cookie."
+        )
     cache['ts'] = now
     cache['url'] = u
     cache['data'] = ck

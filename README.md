@@ -152,3 +152,20 @@ When creating your Hugging Face API key, make sure the following permissions are
 
 ---
 
+### 4. การอัพเดท Google Lens Cookie (กรณีแปลไม่ได้ / Error 500)
+เนื่องจากระบบใช้ Google Lens ในการอ่านข้อความ หากจู่ๆ โปรแกรมแปลไม่ได้หรือไม่ทำงาน (อาจติด Error 500 หรือ Empty Response) แสดงว่า **Cookie หมดอายุ** ให้ทำการอัพเดท Cookie ใหม่ดังนี้:
+
+1. เปิด Terminal แล้วเข้าไปที่โฟลเดอร์ `API`
+2. รันสคริปต์อัพเดท Cookie:
+   ```bash
+   python update_cookie.py
+   ```
+3. สคริปต์จะบอกวิธีเอา Cookie จากหน้าเว็บ `https://lens.google.com`
+   - เปิดเว็บ → กด F12 → แท็บ Network → กด F5 → คลิกรายการแรกสุด → หา `cookie:` ใน Request Headers → Copy value
+4. วาง Cookie ลงในหน้าต่าง Command Prompt แล้วกด Enter
+5. หากขึ้นว่า **✅ บันทึก Cookie สำเร็จแล้ว!** ให้ลองแปลรูปภาพใหม่อีกครั้ง
+
+> **หมายเหตุ:** Cookie จะถูกบันทึกลงไฟล์ `API/cookie.json` ในเครื่องของคุณเท่านั้น ไม่ถูกส่งขึ้นอินเทอร์เน็ต
+> แนะนำให้ใช้ **Google Account สำรอง** ในการเอา Cookie เพื่อความปลอดภัย
+
+---
