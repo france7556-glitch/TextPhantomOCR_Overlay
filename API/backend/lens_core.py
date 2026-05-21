@@ -1179,6 +1179,15 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         run_cmd.append(cmd[1] if len(cmd) > 1 else "")
         stdin_mode = None
 
+    if tool_name == "antigravity" and os.name == "nt":
+        # agy.exe can write its final answer to the attached Windows console
+        # instead of the PIPE handles, which makes stdout appear in the API log
+        # while subprocess sees an empty string. File handles are inherited more
+        # reliably by agy's child process tree.
+        return _run_cli_subprocess_file_capture(
+            run_cmd, timeout_sec, tool_name, cwd, env, stdin_mode
+        )
+
     proc = subprocess.Popen(
         run_cmd,
         stdin=stdin_mode,
@@ -1284,6 +1293,154 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         stdout = "".join(stdout_chunks)
         stderr = "".join(stderr_chunks)
         raise subprocess.TimeoutExpired(cmd, timeout_sec, output=stdout, stderr=stderr)
+
+def _run_cli_subprocess_file_capture(
+    run_cmd: list[str],
+    timeout_sec: float,
+    tool_name: str,
+    cwd: str | None,
+    env: dict[str, str],
+    stdin_mode,
+):
+    import subprocess, tempfile
+
+    class _CliResult:
+        def __init__(self, returncode: int, stdout: str, stderr: str):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    out_fd, out_path = tempfile.mkstemp(
+        prefix=f"textphantom_{tool_name}_stdout_", suffix=".txt"
+    )
+    err_fd, err_path = tempfile.mkstemp(
+        prefix=f"textphantom_{tool_name}_stderr_", suffix=".txt"
+    )
+    os.close(out_fd)
+    os.close(err_fd)
+    proc = None
+    run_cwd = cwd
+    temp_cwd = ""
+    if tool_name == "antigravity":
+        temp_cwd = tempfile.mkdtemp(prefix="textphantom_agy_sandbox_")
+        run_cwd = temp_cwd
+    started_at = time.time()
+    try:
+        with open(out_path, "w", encoding="utf-8", errors="replace") as fout, open(
+            err_path, "w", encoding="utf-8", errors="replace"
+        ) as ferr:
+            proc = subprocess.Popen(
+                run_cmd,
+                stdin=stdin_mode,
+                stdout=fout,
+                stderr=ferr,
+                cwd=run_cwd,
+                env=env,
+            )
+            print(
+                f"[TextPhantom][trace] cli.{tool_name}.spawn pid={proc.pid} cwd={run_cwd!r} capture=file",
+                flush=True,
+            )
+            try:
+                proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                print(
+                    f"[TextPhantom][trace] cli.{tool_name}.kill reason=hard_timeout elapsed={timeout_sec:.1f}s capture=file",
+                    flush=True,
+                )
+                _kill_process_tree(proc.pid)
+                proc.wait(timeout=10)
+                stdout = _read_text_file_best_effort(out_path)
+                stderr = _read_text_file_best_effort(err_path)
+                raise subprocess.TimeoutExpired(
+                    run_cmd, timeout_sec, output=stdout, stderr=stderr
+                )
+
+        stdout = _read_text_file_best_effort(out_path)
+        stderr = _read_text_file_best_effort(err_path)
+        if tool_name == "antigravity" and proc and proc.returncode == 0 and not stdout.strip():
+            transcript_stdout = _read_antigravity_transcript_output(run_cwd, started_at)
+            if transcript_stdout.strip():
+                print(
+                    f"[TextPhantom][trace] cli.{tool_name}.capture transcript_len={len(transcript_stdout)}",
+                    flush=True,
+                )
+                stdout = transcript_stdout
+        return _CliResult(proc.returncode if proc else -1, stdout, stderr)
+    finally:
+        for p in (out_path, err_path):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        if temp_cwd:
+            try:
+                os.rmdir(temp_cwd)
+            except Exception:
+                pass
+
+def _read_text_file_best_effort(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def _read_antigravity_transcript_output(cwd: str | None, started_at: float) -> str:
+    if not cwd:
+        return ""
+    settings_dir = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
+    last_path = os.path.join(settings_dir, "cache", "last_conversations.json")
+    cwd_key = os.path.abspath(cwd)
+    deadline = time.time() + 5.0
+    conv_id = ""
+    transcript_path = ""
+    while time.time() < deadline:
+        try:
+            with open(last_path, "r", encoding="utf-8", errors="replace") as f:
+                last = json.load(f)
+            if isinstance(last, dict):
+                conv_id = str(last.get(cwd_key) or "")
+        except Exception:
+            conv_id = ""
+        if conv_id:
+            transcript_path = os.path.join(
+                settings_dir,
+                "brain",
+                conv_id,
+                ".system_generated",
+                "logs",
+                "transcript.jsonl",
+            )
+            if os.path.exists(transcript_path):
+                break
+        time.sleep(0.25)
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ""
+
+    best = ""
+    for _ in range(20):
+        try:
+            with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("source") != "MODEL" or event.get("status") != "DONE":
+                    continue
+                content = str(event.get("content") or "").strip()
+                if content:
+                    best = content
+            if best:
+                return best
+        except Exception:
+            pass
+        if time.time() - started_at > 10.0:
+            break
+        time.sleep(0.25)
+    return best
 
 def _kill_process_tree(pid: int) -> None:
     if not pid:
