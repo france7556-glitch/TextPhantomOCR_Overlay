@@ -159,6 +159,17 @@ const CLI_CODEX_MODELS = [
   "gpt-5.2",
 ];
 
+const CLI_ANTIGRAVITY_MODELS = [
+  "auto",
+  "Gemini 3.5 Flash (High)",
+  "Gemini 3.5 Flash (Medium)",
+  "Gemini 3.1 Pro (High)",
+  "Gemini 3.1 Pro (Low)",
+  "Claude Sonnet 4.6 (Thinking)",
+  "Claude Opus 4.6 (Thinking)",
+  "GPT-OSS 120B (Medium)"
+];
+
 const modeSel = document.getElementById("mode");
 const langSel = document.getElementById("lang");
 const sourcesSel = document.getElementById("sources");
@@ -642,6 +653,9 @@ function currentModelOptionsFallback() {
   if (source === "cli" && cliTool === "cli_codex") {
     return CLI_CODEX_MODELS;
   }
+  if (source === "cli" && cliTool === "cli_antigravity") {
+    return CLI_ANTIGRAVITY_MODELS;
+  }
   return [];
 }
 
@@ -678,8 +692,13 @@ async function refreshAiMeta({ forcePrompt = false } = {}) {
     setModelOptions(fallbackModels, { keepValue: desiredAiModel, strict: true });
   }
 
-  if (source === "cli" && !["cli_gemini", "cli_codex"].includes(cliToolSel.value)) {
-    const providerLabel = cliToolSel.value === "cli_gemini" ? "Gemini CLI" : "Codex CLI";
+  if (source === "cli" && !["cli_gemini", "cli_codex", "cli_antigravity"].includes(cliToolSel.value)) {
+    const providerLabel =
+      cliToolSel.value === "cli_gemini"
+        ? "Gemini CLI"
+        : cliToolSel.value === "cli_codex"
+          ? "Codex CLI"
+          : "Antigravity CLI";
     setAiKeyStatus("ok", `✓ ${providerLabel} ready`);
     setModelOptions([], { keepValue: "auto" });
     if (forcePrompt) await applyPromptForLang(langSel.value, { forceFetch: true });

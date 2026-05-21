@@ -706,6 +706,26 @@ function classifyJobError(msg) {
     m.includes("gemini cli usage limit")
   )
     return { permanent: true, userMsg: `[ai] CLI/AI usage limit reached`, stage: "ai" };
+  if (
+    m.includes("requires authentication") ||
+    m.includes("please visit the url to log in") ||
+    m.includes("antigravity cli requires authentication")
+  )
+    return {
+      permanent: true,
+      userMsg: "[ai] ต้องล็อกอิน Antigravity CLI (กรุณาเปิด cmd/terminal แล้วรัน `agy --print \"hello\" --dangerously-skip-permissions` เพื่อล็อกอิน)",
+      stage: "ai"
+    };
+  if (
+    m.includes("expecting value") ||
+    m.includes("cookie") ||
+    m.includes("update_cookie.py")
+  )
+    return {
+      permanent: true,
+      userMsg: "[render] คุกกี้หมดอายุ (กรุณาอัปเดตคุกกี้ใหม่)",
+      stage: "render"
+    };
   if (m.includes("rest submit failed"))
     return { permanent: false, userMsg: `[api] ส่งงานล้มเหลว`, stage: "api" };
   if (m.includes("rest poll failed"))

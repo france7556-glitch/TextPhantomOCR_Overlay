@@ -3,13 +3,42 @@ import base64, copy, hashlib, json, math, os, re, struct, time, unicodedata, cv2
 from urllib.parse import parse_qs, urlencode, urlparse
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
+def _load_dotenv():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    paths_to_check = [
+        os.path.join(current_dir, ".env"),
+        os.path.join(os.path.dirname(current_dir), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(current_dir)), ".env")
+    ]
+    for p in paths_to_check:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
+
+_load_dotenv()
+
 IMAGE_PATH = "33.jpg"
 OUT_JSON = "output.json"
 LANG = "th"
 
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 
-FIREBASE_URL = "https://cookie-6e1cd-default-rtdb.asia-southeast1.firebasedatabase.app/lens/cookie.json"
+FIREBASE_URL = os.getenv(
+    "FIREBASE_URL",
+    "https://ocrr-d0032-default-rtdb.asia-southeast1.firebasedatabase.app/lens/cookie.json"
+).strip()
 
 WRITE_OUT_JSON = True
 
@@ -63,6 +92,7 @@ CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "10")))
 CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "230")))
 CLI_IDLE_TIMEOUT_SEC = max(10.0, float(os.getenv("TP_CLI_IDLE_TIMEOUT_SEC", "90")))
 _cli_semaphore = threading.Semaphore(CLI_MAX_CONCURRENCY)
+_settings_lock = threading.Lock()
 
 DRAW_OUTLINE_SPAN = False
 PARA_OUTLINE = (0, 0, 255, 255)
@@ -395,6 +425,10 @@ AI_PROVIDER_DEFAULTS = {
         "model": "auto",
         "base_url": "",
     },
+    "cli_antigravity": {
+        "model": "auto",
+        "base_url": "",
+    },
 }
 
 AI_PROVIDER_ALIASES = {
@@ -415,6 +449,7 @@ AI_PROVIDER_ALIASES = {
     "localhost": "local",
     "cli-gemini": "cli_gemini",
     "cli-codex": "cli_codex",
+    "cli-antigravity": "cli_antigravity",
 }
 
 AI_MODEL_ALIASES = {
@@ -448,6 +483,17 @@ CLI_CODEX_MODELS = [
     "gpt-5.4-mini",
     "gpt-5.3-codex",
     "gpt-5.2",
+]
+
+CLI_ANTIGRAVITY_MODELS = [
+    "auto",
+    "Gemini 3.5 Flash (High)",
+    "Gemini 3.5 Flash (Medium)",
+    "Gemini 3.1 Pro (High)",
+    "Gemini 3.1 Pro (Low)",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
 ]
 
 AI_PROMPT_SYSTEM_BASE = (
@@ -905,6 +951,130 @@ def _cli_codex_generate_json(system_text: str, user_parts: list[str], model: str
             pass
         raise Exception(f"Codex CLI execution failed: {str(e)}")
 
+def _cli_antigravity_generate_json(system_text: str, user_parts: list[str], model: str = "auto", is_retry: bool = False) -> str:
+    import subprocess, shutil
+    text_parts = []
+    for p in user_parts:
+        if (p or "").strip():
+            text_parts.append(p.strip())
+    ocr_text = "\n\n".join(text_parts)
+    ocr_text = re.sub(r"(?i)^\s*Input\s*:\s*", "", ocr_text.strip())
+    full_prompt = "\n\n".join(
+        [
+            str(system_text or "").strip(),
+            "Input:\n" + ocr_text,
+        ]
+    ).strip()
+    
+    exe = shutil.which("agy")
+    if not exe:
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            candidate = os.path.join(local_app_data, "agy", "bin", "agy.exe")
+            if os.path.exists(candidate):
+                exe = candidate
+    if not exe:
+        home = os.path.expanduser("~")
+        candidate = os.path.join(home, "AppData", "Local", "agy", "bin", "agy.exe")
+        if os.path.exists(candidate):
+            exe = candidate
+    if not exe:
+        exe = "agy"
+        
+    timeout_sec = float(CLI_TIMEOUT_SEC)
+    cmd = [exe, "--print", full_prompt, "--dangerously-skip-permissions"]
+    
+    print(
+        f"[TextPhantom][trace] cli.antigravity.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
+        flush=True,
+    )
+    
+    settings_dir = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
+    settings_path = os.path.join(settings_dir, "settings.json")
+    
+    original_settings_str = None
+    settings_modified = False
+    
+    desired_model = (model or "auto").strip()
+    if desired_model and desired_model.lower() != "auto":
+        with _settings_lock:
+            try:
+                if os.path.exists(settings_path):
+                    with open(settings_path, "r", encoding="utf-8", errors="replace") as f:
+                        original_settings_str = f.read()
+                    
+                    try:
+                        settings_data = json.loads(original_settings_str)
+                    except Exception:
+                        settings_data = {}
+                    
+                    if not isinstance(settings_data, dict):
+                        settings_data = {}
+                        
+                    if settings_data.get("model") != desired_model:
+                        settings_data["model"] = desired_model
+                        os.makedirs(settings_dir, exist_ok=True)
+                        with open(settings_path, "w", encoding="utf-8") as f:
+                            json.dump(settings_data, f, indent=2)
+                        settings_modified = True
+            except Exception as e:
+                print(f"[TextPhantom][trace] cli.antigravity.settings_edit_failed error={str(e)}", flush=True)
+                
+    started = time.time()
+    try:
+        with _cli_semaphore:
+            wait_dt = time.time() - started
+            print(
+                f"[TextPhantom][trace] cli.antigravity.begin wait={wait_dt:.1f}s",
+                flush=True,
+            )
+            run_started = time.time()
+            result = _run_cli_subprocess(cmd, timeout_sec, "antigravity")
+        dt = time.time() - run_started
+        print(
+            f"[TextPhantom][trace] cli.antigravity.end code={result.returncode} dt={dt:.1f}s stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
+            flush=True,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            out = (result.stdout or "").strip()
+            detail = err or out or "no output"
+            if "Authentication required" in detail or "accounts.google.com" in detail:
+                raise Exception(
+                    "Antigravity CLI requires authentication.\n"
+                    "Please open a terminal / command prompt on your computer and run:\n\n"
+                    "  agy --print \"hello\" --dangerously-skip-permissions\n\n"
+                    "Follow the URL displayed in the terminal to sign in with Google, "
+                    "then copy and paste the verification code back into the terminal."
+                )
+            raise Exception(f"Antigravity CLI error (Code {result.returncode}): {detail}")
+        txt = (result.stdout or "").strip()
+        if not txt:
+            err = (result.stderr or "").strip()
+            if "Authentication required" in err or "accounts.google.com" in err:
+                raise Exception(
+                    "Antigravity CLI requires authentication.\n"
+                    "Please open a terminal / command prompt on your computer and run:\n\n"
+                    "  agy --print \"hello\" --dangerously-skip-permissions\n\n"
+                    "Follow the URL displayed in the terminal to sign in with Google, "
+                    "then copy and paste the verification code back into the terminal."
+                )
+            raise Exception(f"Antigravity CLI returned empty output{': ' + err[:500] if err else ''}")
+        return txt
+    except subprocess.TimeoutExpired:
+        print(f"[TextPhantom][trace] cli.antigravity.timeout timeout={timeout_sec:.0f}s", flush=True)
+        raise Exception(f"Antigravity CLI request timed out ({timeout_sec:.0f}s)")
+    except Exception as e:
+        raise Exception(f"Antigravity CLI execution failed: {str(e)}")
+    finally:
+        if settings_modified and original_settings_str is not None:
+            with _settings_lock:
+                try:
+                    with open(settings_path, "w", encoding="utf-8") as f:
+                        f.write(original_settings_str)
+                except Exception as e:
+                    print(f"[TextPhantom][trace] cli.antigravity.settings_restore_failed error={str(e)}", flush=True)
+
 def _infer_cli_target_language(system_text: str) -> str:
     s = str(system_text or "")
     m = re.search(r"(?im)^\s*Target\s+language\s*:\s*([^\n\r]+)", s)
@@ -924,8 +1094,23 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
     cwd = os.path.expanduser("~") or None
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
+
+    # Clear agent-specific environment variables to run CLIs in standalone mode
+    for k in list(env.keys()):
+        if k.startswith("ANTIGRAVITY_") or k.startswith("CODEX_"):
+            del env[k]
+        elif k.startswith("GEMINI_"):
+            # Preserve GEMINI_API_KEY and GEMINI_MODEL if manually set
+            if k not in ("GEMINI_API_KEY", "GEMINI_MODEL"):
+                del env[k]
+
+    # Set GEMINI_DIR and GEMINI_HOME to absolute paths to prevent resolution issues
+    gemini_dir = os.path.abspath(os.path.join(os.path.expanduser("~"), ".gemini"))
+    env["GEMINI_DIR"] = gemini_dir
+    env["GEMINI_HOME"] = gemini_dir
+
     run_cmd = cmd
-    stdin_mode = subprocess.PIPE
+    stdin_mode = subprocess.DEVNULL
     if tool_name == "gemini":
         # Gemini CLI relaunches itself unless these are set. In a Python
         # subprocess that relaunch path can hang or fail with spawn EPERM.
@@ -1135,6 +1320,8 @@ def _detect_ai_provider_from_key(api_key: str) -> str:
         return "cli_gemini"
     if kl in ("cli-codex", "cli_codex"):
         return "cli_codex"
+    if kl in ("cli-antigravity", "cli_antigravity"):
+        return "cli_antigravity"
     if kl in ("local", "ollama", "lmstudio", "llama", "llama-server", "localhost", "none", "dummy", "no-key"):
         return "local"
     if kl.startswith("local-") or kl.startswith("local_"):
@@ -1180,7 +1367,7 @@ def _resolve_ai_config():
     if base_url in ("", "auto"):
         base_url = (preset.get("base_url") or "").strip()
 
-    if provider not in ("gemini", "anthropic", "cli_gemini", "cli_codex"):
+    if provider not in ("gemini", "anthropic", "cli_gemini", "cli_codex", "cli_antigravity"):
         if not base_url:
             base_url = (AI_PROVIDER_DEFAULTS.get("openai") or {}).get(
                 "base_url") or "https://api.openai.com/v1"
@@ -4618,14 +4805,19 @@ def get_lens_data_from_image(image_path, firebase_url, lang):
             files={"encoded_image": ("file.jpg", img_bytes, "image/jpeg")},
         )
         if r.status_code not in (302, 303):
-            raise Exception(f"Upload failed: {r.status_code}\n{r.text}")
+            raise Exception(f"Upload failed (status {r.status_code}). Cookie might be invalid or expired. Response: {r.text[:150]}")
         redirect = r.headers["location"]
 
     u = to_translated(redirect, lang=lang)
     with httpx.Client(cookies=ck, headers=hdr, timeout=60) as c:
         j = c.get(u).text
 
-    data = json.loads(j[5:] if j.startswith(")]}'") else j)
+    try:
+        data = json.loads(j[5:] if j.startswith(")]}'") else j)
+    except json.JSONDecodeError as jde:
+        if j.strip().startswith("<") or "login" in j.lower() or "sign in" in j.lower():
+            raise Exception("Google Lens cookie expired or invalid. Please update cookie.json or your Firebase cookie.") from jde
+        raise Exception(f"Google Lens JSON decode error: {jde}. Response: {j[:150]}") from jde
     return data
 
 def _load_local_cookie() -> dict | None:
@@ -4644,11 +4836,14 @@ def _load_local_cookie() -> dict | None:
 
 def _get_firebase_cookie(firebase_url: str):
     # --- Priority 1: local cookie file ---
+    print(f"[TextPhantom][trace] cookie.check_local path={LENS_COOKIE_LOCAL_PATH!r} exists={os.path.isfile(LENS_COOKIE_LOCAL_PATH) if LENS_COOKIE_LOCAL_PATH else False}", flush=True)
     local = _load_local_cookie()
     if local:
+        print(f"[TextPhantom][trace] cookie.source local keys={len(local)}", flush=True)
         return local
 
     # --- Priority 2: Firebase (fallback) ---
+    print("[TextPhantom][trace] cookie.source firebase (local cookie not found)", flush=True)
     u = (firebase_url or '').strip()
     if not u:
         raise Exception(
@@ -4659,6 +4854,7 @@ def _get_firebase_cookie(firebase_url: str):
     now = time.time()
     cache = _FIREBASE_COOKIE_CACHE
     if cache.get('data') and cache.get('url') == u and (now - float(cache.get('ts') or 0)) < float(FIREBASE_COOKIE_TTL_SEC):
+        print(f"[TextPhantom][trace] cookie.source firebase_cache keys={len(cache.get('data') or {})}", flush=True)
         return cache.get('data')
     r = httpx.get(u, timeout=30)
     if r.status_code != 200:
@@ -4669,6 +4865,7 @@ def _get_firebase_cookie(firebase_url: str):
             "Google Lens cookie is null/empty in Firebase DB and no local cookie.json found. "
             "Please run 'python update_cookie.py' in the API folder to set up a local cookie."
         )
+    print(f"[TextPhantom][trace] cookie.source firebase_fresh keys={len(ck)}", flush=True)
     cache['ts'] = now
     cache['url'] = u
     cache['data'] = ck

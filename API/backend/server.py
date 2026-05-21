@@ -610,6 +610,9 @@ def _generate_ai_raw(provider: str, api_key: str, base_url: str, model: str, sys
         raw = core._cli_codex_generate_json(
             system_text, user_parts, model, ai.reasoning_effort, is_retry=is_retry)
         return raw, model
+    if provider == 'cli_antigravity':
+        raw = core._cli_antigravity_generate_json(system_text, user_parts, model, is_retry=is_retry)
+        return raw, model
     if provider == 'gemini':
         raw = core._gemini_generate_json(
             api_key, model, system_text, user_parts)
@@ -654,7 +657,7 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
     if base_url in ('', 'auto'):
         base_url = (preset.get('base_url') or '').strip()
 
-    if provider not in ('gemini', 'anthropic', 'cli_gemini', 'cli_codex'):
+    if provider not in ('gemini', 'anthropic', 'cli_gemini', 'cli_codex', 'cli_antigravity'):
         if not base_url:
             base_url = (_resolve_provider_defaults('openai') or {}).get(
                 'base_url') or 'https://api.openai.com/v1'
@@ -675,7 +678,7 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         'system_len': len(system_text),
         'user_parts': len(user_parts),
     })
-    cli_provider = provider in ('cli_gemini', 'cli_codex')
+    cli_provider = provider in ('cli_gemini', 'cli_codex', 'cli_antigravity')
     try:
         raw, used_model = _generate_ai_raw(
             provider, api_key, base_url, model, system_text, user_parts, ai, is_retry=is_retry)
@@ -1964,7 +1967,7 @@ def _process_payload(payload: dict) -> dict:
             if any(kw in err_str for kw in ('ai ', 'ai_', 'openai', 'gemini', 'anthropic', 'api_key', 'api key',
                                              'rate limit', 'ratelimit', '429', 'quota',
                                              'usage limit', 'resource exhausted', 'daily limit', 'limit reached',
-                                             'codex cli', 'gemini cli',
+                                             'codex cli', 'gemini cli', 'antigravity cli', 'agy cli', 'agy',
                                              'model', 'generate', 'chat/completions')):
                 raise Exception(f'[ai] {e}') from e
             elif any(kw in err_str for kw in ('cannot identify image', 'image file is truncated',
@@ -2101,6 +2104,22 @@ async def ai_resolve(payload: Dict[str, Any]):
         return {
             'ok': True,
             'provider': 'cli_codex',
+            'base_url': '',
+            'default_model': 'auto',
+            'model': resolved_model,
+            'models': models,
+            'lang': lang,
+            'prompt_editable_default': style_default,
+        }
+    if requested_provider == 'cli_antigravity':
+        requested_model = str(payload.get('model') or 'auto').strip() or 'auto'
+        resolved_model = _resolve_model('cli_antigravity', requested_model)
+        models = list(getattr(core, 'CLI_ANTIGRAVITY_MODELS', ['auto']))
+        if resolved_model not in models:
+            models.append(resolved_model)
+        return {
+            'ok': True,
+            'provider': 'cli_antigravity',
             'base_url': '',
             'default_model': 'auto',
             'model': resolved_model,
