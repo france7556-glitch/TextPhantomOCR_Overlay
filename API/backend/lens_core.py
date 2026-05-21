@@ -1111,6 +1111,7 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
 
     run_cmd = cmd
     stdin_mode = subprocess.DEVNULL
+    stdin_payload = None
     if tool_name == "gemini":
         # Gemini CLI relaunches itself unless these are set. In a Python
         # subprocess that relaunch path can hang or fail with spawn EPERM.
@@ -1176,8 +1177,9 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         ]
         if out_path:
             run_cmd.extend(["--output-last-message", out_path])
-        run_cmd.append(cmd[1] if len(cmd) > 1 else "")
-        stdin_mode = None
+        stdin_payload = cmd[1] if len(cmd) > 1 else ""
+        run_cmd.append("-")
+        stdin_mode = subprocess.PIPE
 
     if tool_name == "antigravity" and os.name == "nt":
         # agy.exe can write its final answer to the attached Windows console
@@ -1232,6 +1234,8 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
 
     if stdin_mode == subprocess.PIPE and proc.stdin:
         try:
+            if stdin_payload:
+                proc.stdin.write(stdin_payload)
             proc.stdin.close()
         except Exception:
             pass
