@@ -311,6 +311,70 @@ def _repair_marked_ai_text(ai_text_full: str, expected: int, fallback_paras: Lis
         'marker_missing': missing,
     }
 
+def _complete_ai_markers_with_missing_retry(ai_result: dict, src_paras: List[str], target_lang: str, ai_cfg: "AiConfig", trace_prefix: str, fallback_paras: Optional[List[str]] = None) -> tuple[str, dict]:
+    expected = len(src_paras or [])
+    ai_text_full = str((ai_result or {}).get('aiTextFull') or '')
+    meta = dict((ai_result or {}).get('meta') or {})
+    if expected <= 0 or _has_complete_marker_sequence(ai_text_full, expected):
+        return ai_text_full, meta
+
+    found = _extract_marker_indices(ai_text_full)
+    missing = [i for i in range(expected) if i not in found]
+    if missing and found:
+        retry_lines: List[str] = []
+        for idx in missing:
+            retry_lines.append(f"{TP_PARA_MARKER_PREFIX}{idx}{TP_PARA_MARKER_SUFFIX}")
+            retry_lines.append(_clamp_runaway_repeats(src_paras[idx] if idx < len(src_paras) else ''))
+            retry_lines.append('')
+        retry_text = "\n".join(retry_lines).strip()
+        _trace(f'{trace_prefix}.missing_retry.begin', {
+            'expected_paras': expected,
+            'found_markers': len(found),
+            'missing_markers': len(missing),
+            'missing_preview': missing[:12],
+        })
+        try:
+            retry_ai = ai_translate_text(retry_text, target_lang, ai_cfg, is_retry=True)
+            retry_text_full = str(retry_ai.get('aiTextFull') or '')
+            merged_map = _marker_segment_map(ai_text_full, expected)
+            merged_map.update(_marker_segment_map(retry_text_full, expected))
+            repair_fallback = fallback_paras if isinstance(fallback_paras, list) and len(fallback_paras) == expected else src_paras
+            out_lines: List[str] = []
+            for i in range(expected):
+                out_lines.append(f"{TP_PARA_MARKER_PREFIX}{i}{TP_PARA_MARKER_SUFFIX}")
+                out_lines.append(merged_map.get(i) or _collapse_ws(repair_fallback[i] if i < len(repair_fallback) else ''))
+                out_lines.append('')
+            merged_text = "\n".join(out_lines).strip("\n")
+            retry_found = _extract_marker_indices(retry_text_full)
+            _trace(f'{trace_prefix}.missing_retry.done', {
+                'retry_found_markers': len(retry_found),
+                'complete': _has_complete_marker_sequence(merged_text, expected),
+            })
+            ai_text_full = merged_text
+            meta.update({
+                'marker_missing_retry': True,
+                'marker_missing_retry_count': len(missing),
+                'marker_missing_retry_found': len(retry_found),
+            })
+            if _has_complete_marker_sequence(ai_text_full, expected):
+                return ai_text_full, meta
+        except Exception as e:
+            _trace(f'{trace_prefix}.missing_retry.error', {
+                'error': str(e)[:500],
+                'missing_markers': len(missing),
+            })
+            meta.update({
+                'marker_missing_retry': True,
+                'marker_missing_retry_error': str(e)[:500],
+            })
+
+    repair_fallback = fallback_paras if isinstance(fallback_paras, list) and len(fallback_paras) == expected else src_paras
+    repaired_text, repair_meta = _repair_marked_ai_text(ai_text_full, expected, repair_fallback)
+    meta.update(repair_meta)
+    if repair_meta.get('marker_repaired'):
+        _trace(f'{trace_prefix}.marker_repair', repair_meta)
+    return repaired_text, meta
+
 def _now() -> float:
     return time.time()
 
@@ -973,8 +1037,12 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
                     'found_markers': len(_extract_marker_indices(str(ai.get('aiTextFull') or ''))),
                 })
 
-            ai_text_full = str(ai.get('aiTextFull') or '')
-            meta0 = ai.get('meta') or {}
+            fallback_translated_paras = _tree_to_paragraph_texts(translated_tree or {})
+            ai_text_full, meta0 = _complete_ai_markers_with_missing_retry(
+                ai, src_paras, target_lang, ai_cfg, 'image.single.ai', fallback_translated_paras
+            )
+            ai['aiTextFull'] = ai_text_full
+            ai['meta'] = meta0
             if src_paras:
                 expected = len(src_paras)
                 if not _has_complete_marker_sequence(ai_text_full, expected):
@@ -1653,8 +1721,12 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
                     'found_markers': len(_extract_marker_indices(str(ai.get('aiTextFull') or ''))),
                 })
 
-            ai_text_full = str(ai.get('aiTextFull') or '')
-            meta0 = ai.get('meta') or {}
+            fallback_translated_paras = _tree_to_paragraph_texts(merged_translated_tree or {})
+            ai_text_full, meta0 = _complete_ai_markers_with_missing_retry(
+                ai, src_paras, target_lang, ai_cfg, 'image.split.ai_batch', fallback_translated_paras
+            )
+            ai['aiTextFull'] = ai_text_full
+            ai['meta'] = meta0
             expected = len(src_paras)
             if expected and not _has_complete_marker_sequence(ai_text_full, expected):
                 raise Exception('ai returned incomplete translation (missing text markers)')
