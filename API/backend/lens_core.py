@@ -37,7 +37,7 @@ AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 
 FIREBASE_URL = os.getenv(
     "FIREBASE_URL",
-    "https://ocrr-d0032-default-rtdb.asia-southeast1.firebasedatabase.app/lens/cookie.json"
+    "https://cookie-6e1cd-default-rtdb.asia-southeast1.firebasedatabase.app/lens/cookie.json"
 ).strip()
 
 WRITE_OUT_JSON = True
@@ -89,9 +89,11 @@ DRAW_OUTLINE_ITEM = False
 AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "4"))
 _ai_semaphore = threading.Semaphore(AI_MAX_CONCURRENCY)
 CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "10")))
+CLI_GEMINI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_GEMINI_MAX_CONCURRENCY", "5")))
 CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "230")))
 CLI_IDLE_TIMEOUT_SEC = max(10.0, float(os.getenv("TP_CLI_IDLE_TIMEOUT_SEC", "90")))
 _cli_semaphore = threading.Semaphore(CLI_MAX_CONCURRENCY)
+_cli_gemini_semaphore = threading.Semaphore(CLI_GEMINI_MAX_CONCURRENCY)
 _settings_lock = threading.Lock()
 
 DRAW_OUTLINE_SPAN = False
@@ -463,6 +465,12 @@ AI_MODEL_ALIASES = {
         "flash-image": "gemini-2.5-flash-image",
         "gemma-4": "gemma-4-preview",
         "gemma-3": "gemma-3-27b-it",
+    },
+    "cli_gemini": {
+        "gemini 3.5 flash (high)": "auto",
+        "gemini 3.5 flash (medium)": "auto",
+        "gemini 3.1 pro (high)": "auto",
+        "gemini 3.1 pro (low)": "auto",
     }
 }
 
@@ -795,6 +803,14 @@ def _gemini_generate_json(api_key: str, model: str, system_text: str, user_parts
 def _short_gemini_cli_error(detail: str) -> str:
     text = str(detail or "").strip()
     low = text.lower()
+    if "opening authentication page" in low or ("authentication" in low and "browser" in low):
+        return "Gemini CLI is not authenticated. Run `gemini` in a normal terminal, complete browser login, then try TextPhantom again."
+    if "cannot find module" in low and "@google" in low and "gemini-cli" in low:
+        return "Gemini CLI installation looks broken: a @google/gemini-cli bundle file is missing. Reinstall it with `npm install -g @google/gemini-cli` and run `gemini` once to confirm login."
+    if "error when talking to gemini api" in low:
+        report = re.search(r"full report available at:\s*([^\r\n]+)", text, re.I)
+        suffix = f" Report: {report.group(1).strip()}" if report else ""
+        return f"Gemini CLI could not talk to the Gemini API. This is usually CLI auth, quota/rate limit, network, or Gemini service failure.{suffix}"
     if (
         "usage limit" in low
         or "quota exceeded" in low
@@ -835,12 +851,12 @@ def _cli_gemini_generate_json(system_text: str, user_parts: list[str], model: st
     timeout_sec = float(CLI_TIMEOUT_SEC)
     cmd = [exe, full_prompt, (model or "auto").strip() or "auto"]
     print(
-        f"[TextPhantom][trace] cli.gemini.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
+        f"[TextPhantom][trace] cli.gemini.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_GEMINI_MAX_CONCURRENCY}",
         flush=True,
     )
     started = time.time()
     try:
-        with _cli_semaphore:
+        with _cli_gemini_semaphore:
             wait_dt = time.time() - started
             print(
                 f"[TextPhantom][trace] cli.gemini.begin wait={wait_dt:.1f}s",
@@ -863,9 +879,17 @@ def _cli_gemini_generate_json(system_text: str, user_parts: list[str], model: st
             err = (result.stderr or "").strip()
             raise Exception(f"Gemini CLI returned empty output{': ' + err[:500] if err else ''}")
         return txt
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         print(f"[TextPhantom][trace] cli.gemini.timeout timeout={timeout_sec:.0f}s", flush=True)
-        raise Exception(f"Gemini CLI request timed out ({timeout_sec:.0f}s)")
+        detail = "\n".join(
+            [
+                str(getattr(e, "output", "") or "").strip(),
+                str(getattr(e, "stderr", "") or "").strip(),
+            ]
+        ).strip()
+        short = _short_gemini_cli_error(detail) if detail else ""
+        suffix = f": {short}" if short else ""
+        raise Exception(f"Gemini CLI request timed out ({timeout_sec:.0f}s){suffix}")
     except Exception as e:
         raise Exception(f"Gemini CLI execution failed: {str(e)}")
 
@@ -1151,7 +1175,11 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
                 "--allowed-tools",
                 "none",
             ]
-        stdin_mode = None
+        # The CLI may prompt for browser authentication when it is not logged in.
+        # Backend jobs are non-interactive, so answer "no" and surface a clear
+        # auth error instead of hanging until the idle timeout.
+        stdin_mode = subprocess.PIPE
+        stdin_payload = "n\n"
         print(
             f"[TextPhantom][trace] cli.gemini.env no_relaunch=true sandbox=1 node={node_exe!r}",
             flush=True,
@@ -1345,15 +1373,61 @@ def _run_cli_subprocess_file_capture(
                 f"[TextPhantom][trace] cli.{tool_name}.spawn pid={proc.pid} cwd={run_cwd!r} capture=file",
                 flush=True,
             )
-            try:
-                proc.wait(timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                print(
-                    f"[TextPhantom][trace] cli.{tool_name}.kill reason=hard_timeout elapsed={timeout_sec:.1f}s capture=file",
-                    flush=True,
-                )
-                _kill_process_tree(proc.pid)
-                proc.wait(timeout=10)
+            idle_timeout = float(CLI_IDLE_TIMEOUT_SEC)
+            last_activity = time.time()
+            last_out_size = 0
+            last_err_size = 0
+            killed_reason = ""
+
+            while True:
+                ret = proc.poll()
+                if ret is not None:
+                    break
+
+                elapsed = time.time() - started_at
+
+                # Hard timeout
+                if elapsed > timeout_sec:
+                    killed_reason = f"hard_timeout elapsed={elapsed:.1f}s"
+                    print(
+                        f"[TextPhantom][trace] cli.{tool_name}.kill reason=hard_timeout elapsed={elapsed:.1f}s capture=file",
+                        flush=True,
+                    )
+                    _kill_process_tree(proc.pid)
+                    break
+
+                # Idle detection: monitor stdout/stderr file sizes
+                try:
+                    cur_out = os.path.getsize(out_path)
+                except Exception:
+                    cur_out = last_out_size
+                try:
+                    cur_err = os.path.getsize(err_path)
+                except Exception:
+                    cur_err = last_err_size
+
+                if cur_out != last_out_size or cur_err != last_err_size:
+                    last_activity = time.time()
+                    last_out_size = cur_out
+                    last_err_size = cur_err
+
+                idle_elapsed = time.time() - last_activity
+                if idle_elapsed > idle_timeout:
+                    killed_reason = f"idle_timeout idle={idle_elapsed:.1f}s elapsed={elapsed:.1f}s"
+                    print(
+                        f"[TextPhantom][trace] cli.{tool_name}.kill reason=idle_timeout idle={idle_elapsed:.1f}s elapsed={elapsed:.1f}s capture=file",
+                        flush=True,
+                    )
+                    _kill_process_tree(proc.pid)
+                    break
+
+                time.sleep(0.5)
+
+            if killed_reason:
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
                 stdout = _read_text_file_best_effort(out_path)
                 stderr = _read_text_file_best_effort(err_path)
                 raise subprocess.TimeoutExpired(
@@ -4953,34 +5027,6 @@ def draw_overlay(img, tokens, out_path, thai_path, latin_path, level_outlines=No
     out = Image.alpha_composite(base, overlay).convert("RGB")
     out.save(out_path)
 
-def get_lens_data_from_image(image_path, firebase_url, lang):
-    ck = _get_firebase_cookie(firebase_url)
-
-    with open(image_path, "rb") as f:
-        img_bytes = f.read()
-
-    hdr = {"User-Agent": "Mozilla/5.0", "Referer": "https://lens.google.com/"}
-    with httpx.Client(cookies=ck, headers=hdr, follow_redirects=False, timeout=60) as c:
-        r = c.post(
-            "https://lens.google.com/v3/upload",
-            files={"encoded_image": ("file.jpg", img_bytes, "image/jpeg")},
-        )
-        if r.status_code not in (302, 303):
-            raise Exception(f"Upload failed (status {r.status_code}). Cookie might be invalid or expired. Response: {r.text[:150]}")
-        redirect = r.headers["location"]
-
-    u = to_translated(redirect, lang=lang)
-    with httpx.Client(cookies=ck, headers=hdr, timeout=60) as c:
-        j = c.get(u).text
-
-    try:
-        data = json.loads(j[5:] if j.startswith(")]}'") else j)
-    except json.JSONDecodeError as jde:
-        if j.strip().startswith("<") or "login" in j.lower() or "sign in" in j.lower():
-            raise Exception("Google Lens cookie expired or invalid. Please update cookie.json or your Firebase cookie.") from jde
-        raise Exception(f"Google Lens JSON decode error: {jde}. Response: {j[:150]}") from jde
-    return data
-
 def _load_local_cookie() -> dict | None:
     """Try to load cookie from local file (API/cookie.json)."""
     p = LENS_COOKIE_LOCAL_PATH
@@ -4996,41 +5042,113 @@ def _load_local_cookie() -> dict | None:
     return None
 
 def _get_firebase_cookie(firebase_url: str):
-    # --- Priority 1: local cookie file ---
+    """Fetch cookie with priority: Firebase first -> local fallback."""
+    # --- Priority 1: Firebase ---
+    u = (firebase_url or '').strip()
+    if u:
+        print(f"[TextPhantom][trace] cookie.try_firebase url={u[:60]}...", flush=True)
+        now = time.time()
+        cache = _FIREBASE_COOKIE_CACHE
+        if cache.get('data') and cache.get('url') == u and (now - float(cache.get('ts') or 0)) < float(FIREBASE_COOKIE_TTL_SEC):
+            print(f"[TextPhantom][trace] cookie.source firebase_cache keys={len(cache.get('data') or {})}", flush=True)
+            return cache.get('data')
+        try:
+            r = httpx.get(u, timeout=30)
+            if r.status_code == 200:
+                ck = r.json()
+                if ck and isinstance(ck, dict):
+                    print(f"[TextPhantom][trace] cookie.source firebase_fresh keys={len(ck)}", flush=True)
+                    cache['ts'] = now
+                    cache['url'] = u
+                    cache['data'] = ck
+                    return ck
+                else:
+                    print("[TextPhantom][warn] Firebase cookie is null/empty — trying local cookie instead.", flush=True)
+            else:
+                print(f"[TextPhantom][warn] Firebase cookie fetch failed (HTTP {r.status_code}) — trying local cookie instead.", flush=True)
+        except Exception as fe:
+            print(f"[TextPhantom][warn] Firebase cookie fetch error: {fe} — trying local cookie instead.", flush=True)
+    else:
+        print("[TextPhantom][trace] cookie.no_firebase_url — trying local cookie.", flush=True)
+
+    # --- Priority 2: Local cookie file (fallback) ---
     print(f"[TextPhantom][trace] cookie.check_local path={LENS_COOKIE_LOCAL_PATH!r} exists={os.path.isfile(LENS_COOKIE_LOCAL_PATH) if LENS_COOKIE_LOCAL_PATH else False}", flush=True)
     local = _load_local_cookie()
     if local:
         print(f"[TextPhantom][trace] cookie.source local keys={len(local)}", flush=True)
         return local
 
-    # --- Priority 2: Firebase (fallback) ---
-    print("[TextPhantom][trace] cookie.source firebase (local cookie not found)", flush=True)
-    u = (firebase_url or '').strip()
-    if not u:
-        raise Exception(
-            "No cookie available. "
-            "Please run 'python update_cookie.py' in the API folder to set up a local cookie, "
-            "or configure FIREBASE_URL."
+    # --- ไม่มี cookie ทั้ง 2 แหล่ง ---
+    raise Exception(
+        "\n╔══════════════════════════════════════════════════════════════╗\n"
+        "║  ❌ ไม่พบ Cookie สำหรับ Google Lens                        ║\n"
+        "╠══════════════════════════════════════════════════════════════╣\n"
+        "║  ไม่สามารถดึง cookie จาก Firebase ได้                      ║\n"
+        "║  และไม่พบไฟล์ cookie.json ในเครื่อง                        ║\n"
+        "║                                                            ║\n"
+        "║  วิธีแก้: รัน 'python update_cookie.py' ในโฟลเดอร์ API     ║\n"
+        "║  เพื่อสร้างไฟล์ cookie.json ในเครื่องของคุณ                 ║\n"
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+
+def _lens_request(image_path: str, cookie: dict, lang: str):
+    """Send image to Google Lens and return parsed data."""
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+
+    hdr = {"User-Agent": "Mozilla/5.0", "Referer": "https://lens.google.com/"}
+    with httpx.Client(cookies=cookie, headers=hdr, follow_redirects=False, timeout=60) as c:
+        r = c.post(
+            "https://lens.google.com/v3/upload",
+            files={"encoded_image": ("file.jpg", img_bytes, "image/jpeg")},
         )
-    now = time.time()
-    cache = _FIREBASE_COOKIE_CACHE
-    if cache.get('data') and cache.get('url') == u and (now - float(cache.get('ts') or 0)) < float(FIREBASE_COOKIE_TTL_SEC):
-        print(f"[TextPhantom][trace] cookie.source firebase_cache keys={len(cache.get('data') or {})}", flush=True)
-        return cache.get('data')
-    r = httpx.get(u, timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"Firebase cookie fetch failed: HTTP {r.status_code}")
-    ck = r.json()
-    if not ck:
+        if r.status_code not in (302, 303):
+            raise Exception(f"Upload failed (status {r.status_code}). Cookie might be invalid or expired. Response: {r.text[:150]}")
+        redirect = r.headers["location"]
+
+    u = to_translated(redirect, lang=lang)
+    with httpx.Client(cookies=cookie, headers=hdr, timeout=60) as c:
+        j = c.get(u).text
+
+    try:
+        data = json.loads(j[5:] if j.startswith(")]}'") else j)
+    except json.JSONDecodeError as jde:
+        if j.strip().startswith("<") or "login" in j.lower() or "sign in" in j.lower():
+            raise Exception("Google Lens cookie expired or invalid.") from jde
+        raise Exception(f"Google Lens JSON decode error: {jde}. Response: {j[:150]}") from jde
+    return data
+
+def get_lens_data_from_image(image_path, firebase_url, lang):
+    ck = _get_firebase_cookie(firebase_url)
+
+    try:
+        return _lens_request(image_path, ck, lang)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "expired" not in err_msg and "invalid" not in err_msg:
+            raise  # ไม่ใช่ปัญหา cookie → raise ตามเดิม
+
+    # --- Fallback: ลอง local cookie ถ้า Firebase cookie expired ---
+    print("[TextPhantom][warn] Firebase cookie expired/invalid — trying local cookie.json as fallback.", flush=True)
+    local = _load_local_cookie()
+    if not local:
         raise Exception(
-            "Google Lens cookie is null/empty in Firebase DB and no local cookie.json found. "
-            "Please run 'python update_cookie.py' in the API folder to set up a local cookie."
+            "\n╔══════════════════════════════════════════════════════════════╗\n"
+            "║  ❌ Cookie หมดอายุ — ไม่สามารถใช้ Google Lens ได้          ║\n"
+            "╠══════════════════════════════════════════════════════════════╣\n"
+            "║  Cookie จาก Firebase หมดอายุแล้ว                           ║\n"
+            "║  และไม่พบไฟล์ cookie.json ในเครื่องสำหรับ fallback          ║\n"
+            "║                                                            ║\n"
+            "║  วิธีแก้: รัน 'python update_cookie.py' ในโฟลเดอร์ API     ║\n"
+            "║  เพื่ออัพเดท cookie ใหม่ลงในเครื่องของคุณ                   ║\n"
+            "╚══════════════════════════════════════════════════════════════╝"
         )
-    print(f"[TextPhantom][trace] cookie.source firebase_fresh keys={len(ck)}", flush=True)
-    cache['ts'] = now
-    cache['url'] = u
-    cache['data'] = ck
-    return ck
+
+    # ล้าง firebase cache เพื่อไม่ให้ใช้ cookie expired ซ้ำรอบถัดไป
+    _FIREBASE_COOKIE_CACHE['data'] = None
+    print(f"[TextPhantom][trace] cookie.fallback_local keys={len(local)}", flush=True)
+
+    return _lens_request(image_path, local, lang)
 
 def warmup(lang: str = "th") -> dict:
     l = _normalize_lang(lang)

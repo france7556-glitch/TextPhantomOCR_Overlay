@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-import urllib.request
 
 def _load_dotenv():
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +31,7 @@ _load_dotenv()
 cookie_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.json")
 
 print("=" * 50)
-print("  เครื่องมืออัพเดท Google Lens Cookie (Local & Firebase)")
+print("  เครื่องมืออัพเดท Google Lens Cookie (Local)")
 print("=" * 50)
 print()
 print("วิธีเอา Cookie จาก Google Lens:")
@@ -76,48 +75,10 @@ try:
     print(f"\n✅ บันทึก Cookie ลงในเครื่อง (Local) สำเร็จแล้ว!")
     print(f"   ไฟล์: {cookie_file}")
     print(f"   จำนวน Cookie: {len(cookie_dict)} ตัว")
+    print()
+    print("ตอนนี้ระบบจะใช้ cookie.json นี้เป็น fallback")
+    print("เมื่อ Firebase cookie หมดอายุ ระบบจะเปลี่ยนมาใช้ไฟล์นี้อัตโนมัติ")
 except Exception as e:
     print(f"\n❌ เกิดข้อผิดพลาดในการบันทึกไฟล์: {e}")
-
-# Firebase Upload Option
-print("\n" + "-" * 50)
-default_firebase_url = os.getenv(
-    "FIREBASE_URL",
-    "https://ocrr-d0032-default-rtdb.asia-southeast1.firebasedatabase.app/lens/cookie.json"
-).strip()
-
-print(f"ต้องการอัปโหลด Cookie นี้ไปยัง Firebase ของคุณหรือไม่?")
-print(f"Firebase URL ปัจจุบัน: {default_firebase_url}")
-print("กด Enter เพื่ออัปโหลดไปยัง URL ข้างต้น หรือพิมพ์ URL อื่นที่ต้องการ (หรือพิมพ์ 'n' เพื่อยกเลิก):")
-choice = input().strip()
-
-if choice.lower() != 'n':
-    firebase_url = default_firebase_url
-    if choice and choice.startswith("http"):
-        firebase_url = choice
-    
-    # Ensure path ends with /lens/cookie.json if it's just the root domain
-    if "firebasedatabase.app" in firebase_url or "firebaseio.com" in firebase_url:
-        if not firebase_url.endswith(".json"):
-            firebase_url = firebase_url.rstrip("/") + "/lens/cookie.json"
-            
-    print(f"\nกำลังอัปโหลดไปยัง Firebase: {firebase_url} ...")
-    try:
-        req = urllib.request.Request(
-            firebase_url,
-            data=json.dumps(cookie_dict).encode('utf-8'),
-            headers={'Content-Type': 'application/json'},
-            method='PUT'
-        )
-        with urllib.request.urlopen(req) as response:
-            if response.getcode() == 200:
-                print("✅ อัปโหลดขึ้น Firebase สำเร็จแล้ว!")
-                print("ตอนนี้ระบบที่ดึง Cookie จาก Firebase ของคุณจะใช้งานได้ปกติครับ")
-            else:
-                print(f"❌ อัปโหลดไม่สำเร็จ (Status Code: {response.getcode()})")
-    except Exception as ex:
-        print(f"❌ เกิดข้อผิดพลาดในการอัปโหลดขึ้น Firebase: {ex}")
-else:
-    print("\nยกเลิกการอัปโหลดขึ้น Firebase")
 
 input("\nกด Enter เพื่อปิด...")
