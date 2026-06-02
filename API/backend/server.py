@@ -26,13 +26,13 @@ TP_PARA_MARKER_SUFFIX = '>>'
 TP_RESULT_CACHE_MAX = int(os.environ.get('TP_RESULT_CACHE_MAX', '24'))
 TP_AI_RESULT_CACHE_MAX = int(os.environ.get('TP_AI_RESULT_CACHE_MAX', '16'))
 TP_WARMUP_LANG = (os.environ.get('TP_WARMUP_LANG', 'th') or 'th').strip()
-TP_TILE_MAX_H = max(800, int(os.environ.get('TP_TILE_MAX_H', '3000')))
+TP_TILE_MAX_H = max(800, int(os.environ.get('TP_TILE_MAX_H', '5200')))
 TP_TILE_MIN_H = max(300, int(os.environ.get('TP_TILE_MIN_H', '1200')))
 TP_TILE_SEAM_SEARCH_PX = max(
     0, int(os.environ.get('TP_TILE_SEAM_SEARCH_PX', '700')))
 TP_TILE_SEAM_BAND_PX = max(
     8, int(os.environ.get('TP_TILE_SEAM_BAND_PX', '64')))
-TP_TILE_OVERLAP_PX = max(0, int(os.environ.get('TP_TILE_OVERLAP_PX', '180')))
+TP_TILE_OVERLAP_PX = max(0, int(os.environ.get('TP_TILE_OVERLAP_PX', '420')))
 TP_TILE_DEDUPE_IOU = max(
     0.0, float(os.environ.get('TP_TILE_DEDUPE_IOU', '0.35')))
 TP_TILE_DEDUPE_TEXT_SIM = max(
@@ -1272,22 +1272,52 @@ def _image_row_detail_scores(img) -> Optional["core.np.ndarray"]:
         dy = np.concatenate([dy[:1], dy])
         dx = np.abs(np.diff(arr, axis=1)).mean(axis=1)
         contrast = arr.std(axis=1)
-        dark_or_light = ((arr < 70) | (arr > 245)).mean(axis=1) * 10.0
-        score = dy + (dx * 0.35) + (contrast * 0.08) + dark_or_light
+        uniform_dark = (arr < 45).mean(axis=1)
+
+        raw_detail = dy + (dx * 0.35) + (contrast * 0.08)
+        # Low-detail gutters, including white page gaps and solid dark scene
+        # breaks, are good cut points. Text, panel art, and bubble outlines
+        # produce detail/contrast and therefore score higher.
+        score = raw_detail - (uniform_dark * 1.5)
+
+        # Penalize quiet/low-detail rows sandwiched between high-detail rows (within 60px)
+        # to prevent cutting through the middle of a speech bubble or text paragraph.
+        threshold = 6.0
+        D = 60
+        max_above = np.zeros_like(raw_detail)
+        max_below = np.zeros_like(raw_detail)
+        
+        shifted_above = []
+        for i in range(1, D + 1):
+            shifted_above.append(np.pad(raw_detail[:-i], (i, 0), mode='constant', constant_values=0.0))
+        if shifted_above:
+            max_above = np.maximum.reduce(shifted_above)
+            
+        shifted_below = []
+        for i in range(1, D + 1):
+            shifted_below.append(np.pad(raw_detail[i:], (0, i), mode='constant', constant_values=0.0))
+        if shifted_below:
+            max_below = np.maximum.reduce(shifted_below)
+            
+        is_sandwiched = (raw_detail < threshold) & (max_above > threshold) & (max_below > threshold)
+        penalty = np.where(is_sandwiched, 15.0 * (1.0 - raw_detail / threshold), 0.0)
+        score = score + penalty
+        
         return _rolling_mean(score, max(2, TP_TILE_SEAM_BAND_PX // 2))
     except Exception as e:
         _dbg('image.split.smart_seam.score_failed', {'err': str(e)[:200]})
         return None
 
-def _choose_smart_cut_y(row_scores, y0: int, target_y: int, total_h: int) -> int:
+def _choose_smart_cut_y(row_scores, y0: int, target_y: int, total_h: int, max_h: int) -> int:
     if row_scores is None or TP_TILE_SEAM_SEARCH_PX <= 0:
         return target_y
     np = core.np
     target_y = int(max(y0 + 1, min(target_y, total_h)))
-    if total_h - y0 <= TP_TILE_MAX_H:
+    max_h = max(1, int(max_h or TP_TILE_MAX_H))
+    if total_h - y0 <= max_h:
         return total_h
 
-    lo = max(y0 + min(TP_TILE_MIN_H, max(1, TP_TILE_MAX_H - TP_TILE_SEAM_SEARCH_PX)),
+    lo = max(y0 + min(TP_TILE_MIN_H, max(1, max_h - TP_TILE_SEAM_SEARCH_PX)),
              target_y - TP_TILE_SEAM_SEARCH_PX)
     hi = min(target_y, total_h - 1)
     if hi <= lo:
@@ -1323,14 +1353,16 @@ def _build_vertical_tiles(img, max_h: int):
             cut_y = H
         else:
             target_y = y + max_h
-            cut_y = _choose_smart_cut_y(row_scores, y, target_y, H)
+            cut_y = _choose_smart_cut_y(row_scores, y, target_y, H, max_h)
             if cut_y <= y:
                 cut_y = target_y
         tile_h = cut_y - y
         tiles.append((y, tile_h, img.crop((0, y, W, cut_y))))
         if cut_y >= H:
             break
-        overlap = min(TP_TILE_OVERLAP_PX, max(0, tile_h - TP_TILE_MIN_H))
+        # Always use full overlap to prevent word splitting at tile boundaries.
+        # Clamp so we don't overlap more than the tile height itself (minus a small minimum tile height).
+        overlap = min(TP_TILE_OVERLAP_PX, max(0, tile_h - 100))
         next_y = max(y + 1, cut_y - overlap)
         y = next_y
     return tiles
@@ -1471,6 +1503,258 @@ def _looks_duplicate_para(a: dict, b: dict, W: int, H: int) -> bool:
     max_center_delta = max(18.0, min(120.0, (ah + bh) * 0.75))
     return abs(_bbox_center_y(ab) - _bbox_center_y(bb)) <= max_center_delta
 
+def _merge_overlapping_texts(t1: str, t2: str) -> str:
+    t1 = t1.strip()
+    t2 = t2.strip()
+    if not t1: return t2
+    if not t2: return t1
+    
+    w1 = t1.split()
+    w2 = t2.split()
+    
+    max_overlap = min(len(w1), len(w2))
+    for k in range(max_overlap, 0, -1):
+        if w1[-k:] == w2[:k]:
+            return " ".join(w1 + w2[k:])
+            
+    max_char_overlap = min(len(t1), len(t2))
+    for k in range(max_char_overlap, 0, -1):
+        if t1[-k:] == t2[:k]:
+            return t1 + t2[k:]
+            
+    return t1 + " " + t2
+
+def _looks_duplicate_item(it1: dict, it2: dict, W: int, H: int) -> bool:
+    b1 = _box_from_norm(it1.get('box'), W, H)
+    b2 = _box_from_norm(it2.get('box'), W, H)
+    if not b1 or not b2:
+        return False
+    if _bbox_iou(b1, b2) >= 0.60:
+        return True
+    return False
+
+def _merge_para_texts(a: dict, b: dict, W: int, H: int) -> dict:
+    merged_text = _merge_overlapping_texts(a.get('text') or '', b.get('text') or '')
+    
+    combined_items = []
+    for it in (a.get('items') or []):
+        combined_items.append(copy.deepcopy(it))
+    for it in (b.get('items') or []):
+        dup = False
+        for existing in combined_items:
+            if _looks_duplicate_item(existing, it, W, H):
+                t_ext = existing.get('text') or ''
+                t_it = it.get('text') or ''
+                if len(t_it) > len(t_ext):
+                    existing['text'] = t_it
+                    existing['box'] = copy.deepcopy(it['box'])
+                    existing['spans'] = copy.deepcopy(it.get('spans') or [])
+                dup = True
+                break
+        if not dup:
+            combined_items.append(copy.deepcopy(it))
+            
+    def get_item_y(it):
+        box = it.get('box') or {}
+        return float(box.get('center', {}).get('y', 0.0) or box.get('top', 0.0))
+        
+    combined_items.sort(key=get_item_y)
+    for idx, it in enumerate(combined_items):
+        it['item_index'] = idx
+        
+    ab = a.get('bounds_px')
+    bb = b.get('bounds_px')
+    if ab and bb:
+        merged_bounds = (
+            min(ab[0], bb[0]),
+            min(ab[1], bb[1]),
+            max(ab[2], bb[2]),
+            max(ab[3], bb[3]),
+        )
+    elif ab:
+        merged_bounds = ab
+    else:
+        merged_bounds = bb
+        
+    return {
+        'side': a.get('side', 'original'),
+        'para_index': a.get('para_index', 0),
+        'text': merged_text,
+        'valid_text': bool(merged_text.strip()),
+        'bounds_px': merged_bounds,
+        'items': combined_items,
+    }
+
+def _looks_seam_split_pair(a: dict, b: dict, W: int, H: int, tile_ranges: list) -> bool:
+    ab = _para_bbox_px(a, W, H)
+    bb = _para_bbox_px(b, W, H)
+    if not ab or not bb:
+        return False
+
+    al, at, ar, abottom = ab
+    bl, bt, br, bbottom = bb
+    
+    h_overlap = max(0.0, min(ar, br) - max(al, bl))
+    min_w = min(ar - al, br - bl)
+    if min_w <= 0:
+        return False
+        
+    if h_overlap / min_w < 0.50:
+        return False
+
+    cy_a = (at + abottom) / 2.0
+    cy_b = (bt + bbottom) / 2.0
+    
+    for i in range(len(tile_ranges) - 1):
+        y_curr, h_curr = tile_ranges[i]
+        y_next, h_next = tile_ranges[i+1]
+        seam_y = y_curr + h_curr
+        
+        if cy_a < seam_y < cy_b:
+            vertical_gap = bt - abottom
+            if -80 <= vertical_gap <= 200:
+                return True
+                
+    return False
+
+def _patch_text_onto_original_geometry(
+    original_tree: dict,
+    translated_tree: dict,
+    translated_text_full: str = '',
+    target_lang: str = '',
+    thai_font: str = '',
+    latin_font: str = '',
+    W: int = 800,
+    H: int = 1200,
+) -> tuple[dict, dict]:
+    meta = {'patched': False, 'paragraphs': 0}
+    if not isinstance(original_tree, dict) or not isinstance(translated_tree, dict):
+        return None, meta
+
+    orig_paras = original_tree.get('paragraphs') or []
+    trans_paras = translated_tree.get('paragraphs') or []
+    if not orig_paras:
+        return None, meta
+
+    patched_paras = []
+    for i, orig_p in enumerate(orig_paras):
+        trans_p = None
+        orig_idx = orig_p.get('para_index')
+        if orig_idx is not None:
+            for tp in trans_paras:
+                if tp.get('para_index') == orig_idx:
+                    trans_p = tp
+                    break
+        if trans_p is None and i < len(trans_paras):
+            trans_p = trans_paras[i]
+            
+        if trans_p is None:
+            patched_p = copy.deepcopy(orig_p)
+            patched_p['side'] = 'translated'
+            patched_p['text'] = ''
+            patched_p['valid_text'] = False
+            for it in patched_p.get('items') or []:
+                it['side'] = 'translated'
+                it['text'] = ''
+                it['valid_text'] = False
+                for sp in it.get('spans') or []:
+                    sp['side'] = 'translated'
+                    sp['text'] = ''
+                    sp['valid_text'] = False
+            patched_paras.append(patched_p)
+            continue
+
+        trans_text = trans_p.get('text') or ''
+        patched_p = copy.deepcopy(orig_p)
+        patched_p['side'] = 'translated'
+        patched_p['text'] = trans_text
+        patched_p['valid_text'] = bool(trans_text.strip())
+        
+        orig_items = orig_p.get('items') or []
+        if not orig_items:
+            patched_paras.append(patched_p)
+            meta['paragraphs'] += 1
+            continue
+
+        total_orig_len = sum(len(it.get('text') or '') for it in orig_items)
+        words = trans_text.split()
+        total_words = len(words)
+        
+        item_texts = []
+        if total_words == 0:
+            item_texts = [''] * len(orig_items)
+        else:
+            accum = 0.0
+            word_indices = [0]
+            for it_idx in range(len(orig_items) - 1):
+                ratio = len(orig_items[it_idx].get('text') or '') / max(1, total_orig_len)
+                accum += ratio * total_words
+                target_idx = int(round(accum))
+                target_idx = max(word_indices[-1], min(total_words, target_idx))
+                word_indices.append(target_idx)
+            word_indices.append(total_words)
+            
+            for it_idx in range(len(orig_items)):
+                w_start = word_indices[it_idx]
+                w_end = word_indices[it_idx + 1]
+                item_texts.append(" ".join(words[w_start:w_end]))
+
+        patched_items = patched_p.get('items') or []
+        for it_idx, it in enumerate(patched_items):
+            it['side'] = 'translated'
+            it_text = item_texts[it_idx]
+            it['text'] = it_text
+            it['valid_text'] = bool(it_text.strip())
+            
+            orig_spans = orig_items[it_idx].get('spans') or []
+            if orig_spans:
+                span_words = it_text.split()
+                total_span_words = len(span_words)
+                total_orig_span_len = sum(len(sp.get('text') or '') for sp in orig_spans)
+                
+                span_texts = []
+                if total_span_words == 0:
+                    span_texts = [''] * len(orig_spans)
+                else:
+                    span_accum = 0.0
+                    span_indices = [0]
+                    for sp_idx in range(len(orig_spans) - 1):
+                        ratio = len(orig_spans[sp_idx].get('text') or '') / max(1, total_orig_span_len)
+                        span_accum += ratio * total_span_words
+                        target_idx = int(round(span_accum))
+                        target_idx = max(span_indices[-1], min(total_span_words, target_idx))
+                        span_indices.append(target_idx)
+                    span_indices.append(total_span_words)
+                    
+                    for sp_idx in range(len(orig_spans)):
+                        s_start = span_indices[sp_idx]
+                        s_end = span_indices[sp_idx + 1]
+                        span_texts.append(" ".join(span_words[s_start:s_end]))
+                
+                for sp_idx, sp in enumerate(it.get('spans') or []):
+                    sp['side'] = 'translated'
+                    sp_text = span_texts[sp_idx]
+                    sp['text'] = sp_text
+                    sp['valid_text'] = bool(sp_text.strip())
+            
+        patched_paras.append(patched_p)
+        meta['paragraphs'] += 1
+
+    patched_tree = {
+        'side': 'translated',
+        'paragraphs': patched_paras,
+    }
+    meta['patched'] = True
+    return patched_tree, meta
+
+def _combined_erase_spans(original_tree: dict, translated_tree: dict) -> list:
+    spans = []
+    if isinstance(original_tree, dict):
+        spans.extend(core.flatten_tree_spans(original_tree))
+    if isinstance(translated_tree, dict):
+        spans.extend(core.flatten_tree_spans(translated_tree))
+    return spans
+
 def _reindex_tree_paragraphs(tree: dict) -> None:
     if not isinstance(tree, dict):
         return
@@ -1486,13 +1770,43 @@ def _reindex_tree_paragraphs(tree: dict) -> None:
                 if isinstance(sp, dict):
                     sp['para_index'] = idx
 
-def _dedupe_tree_paragraphs(tree: dict, W: int, H: int) -> dict:
+def _dedupe_tree_paragraphs(tree: dict, W: int, H: int, tile_ranges: list = None) -> dict:
     if not isinstance(tree, dict):
-        return {'removed': 0}
+        return {'removed': 0, 'merged': 0}
     paras = [p for p in (tree.get('paragraphs') or []) if isinstance(p, dict)]
     if len(paras) <= 1:
         _reindex_tree_paragraphs(tree)
-        return {'removed': 0}
+        return {'removed': 0, 'merged': 0}
+
+    merged_count = 0
+    if tile_ranges:
+        changed = True
+        while changed:
+            changed = False
+            sorted_paras = sorted(
+                paras,
+                key=lambda x: _bbox_center_y(_para_bbox_px(x, W, H))
+            )
+            new_paras = []
+            skip = set()
+            for i, p in enumerate(sorted_paras):
+                if i in skip:
+                    continue
+                merged_this = False
+                for j in range(i + 1, min(i + 6, len(sorted_paras))):
+                    if j in skip:
+                        continue
+                    if _looks_seam_split_pair(p, sorted_paras[j], W, H, tile_ranges):
+                        merged_p = _merge_para_texts(p, sorted_paras[j], W, H)
+                        new_paras.append(merged_p)
+                        skip.add(j)
+                        merged_count += 1
+                        changed = True
+                        merged_this = True
+                        break
+                if not merged_this:
+                    new_paras.append(p)
+            paras = new_paras
 
     kept: List[dict] = []
     removed = 0
@@ -1504,7 +1818,6 @@ def _dedupe_tree_paragraphs(tree: dict, W: int, H: int) -> dict:
                 dup_idx = i
                 break
         if dup_idx is not None:
-            # Keep the paragraph with MORE text (more complete version)
             existing_text = _norm_dedupe_text(_para_text(kept[dup_idx]))
             new_text = _norm_dedupe_text(_para_text(p))
             if len(new_text) > len(existing_text):
@@ -1514,7 +1827,7 @@ def _dedupe_tree_paragraphs(tree: dict, W: int, H: int) -> dict:
             kept.append(p)
     tree['paragraphs'] = kept
     _reindex_tree_paragraphs(tree)
-    return {'removed': removed}
+    return {'removed': removed, 'merged': merged_count}
 
 def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
     t_total = time.perf_counter()
@@ -1648,10 +1961,11 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
             chunk_img = core.Image.open(io.BytesIO(img_bytes)).convert("RGB")
             merged_images.append((offset_y, chunk_img))
 
+    tile_ranges_for_dedupe = [(y, h) for y, h, _ in tiles]
     dedupe_meta = {
-        'original': _dedupe_tree_paragraphs(merged_original_tree, W, H),
-        'translated': _dedupe_tree_paragraphs(merged_translated_tree, W, H),
-        'Ai': _dedupe_tree_paragraphs(merged_ai_tree, W, H),
+        'original': _dedupe_tree_paragraphs(merged_original_tree, W, H, tile_ranges_for_dedupe),
+        'translated': _dedupe_tree_paragraphs(merged_translated_tree, W, H, tile_ranges_for_dedupe),
+        'Ai': _dedupe_tree_paragraphs(merged_ai_tree, W, H, tile_ranges_for_dedupe),
     }
     _trace('image.merge.dedupe', dedupe_meta)
     merged['splitMeta'] = {
@@ -1693,6 +2007,30 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         latin_font = getattr(core, 'FONT_ZH_SC_PATH', latin_font)
     elif target_lang in ('zh-hant', 'zh_tw', 'zh-tw', 'zh_hant'):
         latin_font = getattr(core, 'FONT_ZH_TC_PATH', latin_font)
+
+    if isinstance(merged_original_tree, dict) and isinstance(merged_translated_tree, dict):
+        t_patch_tr = time.perf_counter()
+        patched_translated_tree, patch_meta = _patch_text_onto_original_geometry(
+            merged_original_tree,
+            merged_translated_tree,
+            merged.get('translatedTextFull') or '',
+            target_lang,
+            thai_font or '',
+            latin_font or '',
+            W,
+            H,
+        )
+        if patched_translated_tree:
+            merged_translated_tree = patched_translated_tree
+            merged_translated_text = _tree_to_paragraph_texts(merged_translated_tree)
+            merged['translatedTextFull'] = "\n\n".join(merged_translated_text)
+            if 'translated' in merged and isinstance(merged['translated'], dict):
+                merged['translated']['translatedTree'] = merged_translated_tree
+                merged['translated']['translatedTextFull'] = merged['translatedTextFull']
+        _trace('image.merge.translated_geometry_patch', {
+            'ms': _elapsed_ms(t_patch_tr),
+            **patch_meta,
+        })
 
     if ai_cfg and str(mode or '').strip() == 'lens_text' and getattr(core, 'DO_AI', True):
         t_ai_batch = time.perf_counter()
@@ -1801,7 +2139,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
     # shifted to full-image coordinates) ensures every detected text region
     # is erased cleanly.
     t_combine = time.perf_counter()
-    merged_spans = core.flatten_tree_spans(merged_original_tree)
+    merged_spans = _combined_erase_spans(merged_original_tree, merged_translated_tree)
     if merged_spans and getattr(core, 'ERASE_OLD_TEXT_WITH_ORIGINAL_BOXES', True):
         erased_full = core.erase_text_with_boxes(
             img.convert('RGB'),
