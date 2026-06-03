@@ -89,10 +89,12 @@ DRAW_OUTLINE_ITEM = False
 AI_MAX_CONCURRENCY = int(os.getenv("AI_MAX_CONCURRENCY", "4"))
 _ai_semaphore = threading.Semaphore(AI_MAX_CONCURRENCY)
 CLI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_MAX_CONCURRENCY", "10")))
+CLI_ANTIGRAVITY_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_ANTIGRAVITY_MAX_CONCURRENCY", "5")))
 CLI_GEMINI_MAX_CONCURRENCY = max(1, int(os.getenv("TP_CLI_GEMINI_MAX_CONCURRENCY", "5")))
 CLI_TIMEOUT_SEC = max(15.0, float(os.getenv("TP_CLI_TIMEOUT_SEC", "230")))
 CLI_IDLE_TIMEOUT_SEC = max(10.0, float(os.getenv("TP_CLI_IDLE_TIMEOUT_SEC", "90")))
 _cli_semaphore = threading.Semaphore(CLI_MAX_CONCURRENCY)
+_cli_antigravity_semaphore = threading.Semaphore(CLI_ANTIGRAVITY_MAX_CONCURRENCY)
 _cli_gemini_semaphore = threading.Semaphore(CLI_GEMINI_MAX_CONCURRENCY)
 _settings_lock = threading.Lock()
 
@@ -495,10 +497,11 @@ CLI_CODEX_MODELS = [
 
 CLI_ANTIGRAVITY_MODELS = [
     "auto",
-    "Gemini 3.5 Flash (High)",
     "Gemini 3.5 Flash (Medium)",
-    "Gemini 3.1 Pro (High)",
+    "Gemini 3.5 Flash (High)",
+    "Gemini 3.5 Flash (Low)",
     "Gemini 3.1 Pro (Low)",
+    "Gemini 3.1 Pro (High)",
     "Claude Sonnet 4.6 (Thinking)",
     "Claude Opus 4.6 (Thinking)",
     "GPT-OSS 120B (Medium)",
@@ -1009,7 +1012,7 @@ def _cli_antigravity_generate_json(system_text: str, user_parts: list[str], mode
     cmd = [exe, "--print", full_prompt, "--dangerously-skip-permissions"]
     
     print(
-        f"[TextPhantom][trace] cli.antigravity.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_MAX_CONCURRENCY}",
+        f"[TextPhantom][trace] cli.antigravity.queue exe={exe!r} prompt_len={len(full_prompt)} timeout={timeout_sec:.0f}s max_concurrency={CLI_ANTIGRAVITY_MAX_CONCURRENCY}",
         flush=True,
     )
     
@@ -1046,7 +1049,7 @@ def _cli_antigravity_generate_json(system_text: str, user_parts: list[str], mode
                 
     started = time.time()
     try:
-        with _cli_semaphore:
+        with _cli_antigravity_semaphore:
             wait_dt = time.time() - started
             print(
                 f"[TextPhantom][trace] cli.antigravity.begin wait={wait_dt:.1f}s",
@@ -1121,8 +1124,15 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
 
     # Clear agent-specific environment variables to run CLIs in standalone mode
     for k in list(env.keys()):
-        if k.startswith("ANTIGRAVITY_") or k.startswith("CODEX_"):
+        if k.startswith("ANTIGRAVITY_"):
             del env[k]
+        elif k.startswith("CODEX_"):
+            # Codex CLI auth for the codex-lb provider is passed through
+            # CODEX_LB_API_KEY in current desktop installs. Dropping every
+            # CODEX_* variable makes non-interactive translation fail after
+            # the CLI starts successfully.
+            if k not in ("CODEX_API_KEY", "CODEX_LB_API_KEY", "CODEX_HOME"):
+                del env[k]
         elif k.startswith("GEMINI_"):
             # Preserve GEMINI_API_KEY and GEMINI_MODEL if manually set
             if k not in ("GEMINI_API_KEY", "GEMINI_MODEL"):
@@ -1205,9 +1215,11 @@ def _run_cli_subprocess(cmd: list[str], timeout_sec: float, tool_name: str):
         ]
         if out_path:
             run_cmd.extend(["--output-last-message", out_path])
-        stdin_payload = cmd[1] if len(cmd) > 1 else ""
-        run_cmd.append("-")
-        stdin_mode = subprocess.PIPE
+        # Codex CLI 0.134 exits with "stdin is not a terminal" when `exec -`
+        # is fed from a redirected backend pipe on Windows. Passing the prompt
+        # as the positional argument keeps non-interactive jobs reliable.
+        run_cmd.append(cmd[1] if len(cmd) > 1 else "")
+        stdin_mode = subprocess.DEVNULL
 
     if tool_name == "antigravity" and os.name == "nt":
         # agy.exe can write its final answer to the attached Windows console
@@ -1494,6 +1506,8 @@ def _read_antigravity_transcript_output(cwd: str | None, started_at: float) -> s
                 break
         time.sleep(0.25)
     if not transcript_path or not os.path.exists(transcript_path):
+        transcript_path = _find_recent_antigravity_transcript(settings_dir, started_at)
+    if not transcript_path or not os.path.exists(transcript_path):
         return ""
 
     best = ""
@@ -1519,6 +1533,33 @@ def _read_antigravity_transcript_output(cwd: str | None, started_at: float) -> s
             break
         time.sleep(0.25)
     return best
+
+def _find_recent_antigravity_transcript(settings_dir: str, started_at: float) -> str:
+    brain_dir = os.path.join(settings_dir, "brain")
+    try:
+        if not os.path.isdir(brain_dir):
+            return ""
+        candidates: list[tuple[float, str]] = []
+        for conv_id in os.listdir(brain_dir):
+            path = os.path.join(
+                brain_dir,
+                conv_id,
+                ".system_generated",
+                "logs",
+                "transcript.jsonl",
+            )
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                continue
+            if mtime + 2.0 >= started_at:
+                candidates.append((mtime, path))
+        if not candidates:
+            return ""
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return ""
 
 def _kill_process_tree(pid: int) -> None:
     if not pid:

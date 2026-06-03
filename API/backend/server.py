@@ -409,7 +409,7 @@ def _ai_prompt_sig(s: str) -> str:
 def _build_cache_key(img_hash: str, lang: str, mode: str, source: str, ai_cfg: Optional["AiConfig"]) -> str:
     parts = [img_hash, _normalize_lang(
         lang), (mode or '').strip(), (source or '').strip()]
-    if ai_cfg and (source or '').strip().lower() == 'ai':
+    if ai_cfg:
         parts.extend([
             (ai_cfg.provider or '').strip(),
             (ai_cfg.model or '').strip(),
@@ -461,6 +461,25 @@ def _resolve_provider_defaults(provider: str) -> dict:
 
 def _resolve_model(provider: str, model: str) -> str:
     return core._resolve_model(provider, model)
+
+def _cli_models_for_provider(provider: str) -> List[str]:
+    p = core._canonical_provider(provider or '')
+    attr = {
+        'cli_gemini': 'CLI_GEMINI_MODELS',
+        'cli_codex': 'CLI_CODEX_MODELS',
+        'cli_antigravity': 'CLI_ANTIGRAVITY_MODELS',
+    }.get(p)
+    models = list(getattr(core, attr, ['auto']) if attr else ['auto'])
+    return [str(m).strip() for m in models if str(m).strip()] or ['auto']
+
+def _resolve_cli_model(provider: str, model: str) -> str:
+    models = _cli_models_for_provider(provider)
+    resolved = _resolve_model(provider, str(model or 'auto').strip() or 'auto')
+    if resolved in models:
+        return resolved
+    if 'auto' in models:
+        return 'auto'
+    return models[0]
 
 def _has_meaningful_text(s: str) -> bool:
     t = _tp_marker_re.sub('', str(s or ''))
@@ -716,6 +735,8 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
     preset = _resolve_provider_defaults(provider) or {}
 
     model = _resolve_model(provider, (ai.model or 'auto'))
+    if provider in ('cli_gemini', 'cli_codex', 'cli_antigravity'):
+        model = _resolve_cli_model(provider, ai.model or 'auto')
 
     base_url = (ai.base_url or 'auto').strip()
     if base_url in ('', 'auto'):
@@ -2307,9 +2328,10 @@ def _process_payload(payload: dict) -> dict:
     is_ai_source = source == 'ai' or source.startswith('cli_')
     if mode == 'lens_text' and is_ai_source:
         if source.startswith('cli_'):
+            requested_model = str(ai.get('model') if isinstance(ai, dict) else 'auto').strip() or 'auto'
             ai_cfg = AiConfig(
                 api_key=source,
-                model=str(ai.get('model') if isinstance(ai, dict) else 'auto').strip() or 'auto',
+                model=_resolve_cli_model(source, requested_model),
                 provider=source,
                 base_url='auto',
                 prompt_editable=str(ai.get('prompt') if isinstance(ai, dict) else ''),
@@ -2341,7 +2363,7 @@ def _process_payload(payload: dict) -> dict:
     img_hash = _sha256_hex(img_bytes)
     cache_key = ''
     if mode == 'lens_text' and img_hash:
-        cache_source = 'ai' if is_ai_source else 'text'
+        cache_source = source if is_ai_source else 'text'
         cache_key = _build_cache_key(
             img_hash, lang, mode, cache_source, ai_cfg)
         cached = None
@@ -2490,10 +2512,8 @@ async def ai_resolve(payload: Dict[str, Any]):
     style_default = ((getattr(core, 'AI_LANG_STYLE', {}) or {}).get(lang) or (getattr(core, 'AI_LANG_STYLE', {}) or {}).get('default') or '').strip()
     if requested_provider == 'cli_gemini':
         requested_model = str(payload.get('model') or 'auto').strip() or 'auto'
-        resolved_model = _resolve_model('cli_gemini', requested_model)
-        models = list(getattr(core, 'CLI_GEMINI_MODELS', ['auto']))
-        if resolved_model not in models:
-            models.append(resolved_model)
+        resolved_model = _resolve_cli_model('cli_gemini', requested_model)
+        models = _cli_models_for_provider('cli_gemini')
         return {
             'ok': True,
             'provider': 'cli_gemini',
@@ -2507,10 +2527,8 @@ async def ai_resolve(payload: Dict[str, Any]):
         }
     if requested_provider == 'cli_codex':
         requested_model = str(payload.get('model') or 'auto').strip() or 'auto'
-        resolved_model = _resolve_model('cli_codex', requested_model)
-        models = list(getattr(core, 'CLI_CODEX_MODELS', ['auto']))
-        if resolved_model not in models:
-            models.append(resolved_model)
+        resolved_model = _resolve_cli_model('cli_codex', requested_model)
+        models = _cli_models_for_provider('cli_codex')
         return {
             'ok': True,
             'provider': 'cli_codex',
@@ -2523,10 +2541,8 @@ async def ai_resolve(payload: Dict[str, Any]):
         }
     if requested_provider == 'cli_antigravity':
         requested_model = str(payload.get('model') or 'auto').strip() or 'auto'
-        resolved_model = _resolve_model('cli_antigravity', requested_model)
-        models = list(getattr(core, 'CLI_ANTIGRAVITY_MODELS', ['auto']))
-        if resolved_model not in models:
-            models.append(resolved_model)
+        resolved_model = _resolve_cli_model('cli_antigravity', requested_model)
+        models = _cli_models_for_provider('cli_antigravity')
         return {
             'ok': True,
             'provider': 'cli_antigravity',
