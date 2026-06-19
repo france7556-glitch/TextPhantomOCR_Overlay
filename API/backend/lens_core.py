@@ -393,6 +393,10 @@ AI_PROVIDER_DEFAULTS = {
         "model": "google/gemma-4-31b-it:free",
         "base_url": "https://openrouter.ai/api/v1",
     },
+    "opencode": {
+        "model": "gpt-5.4-mini",
+        "base_url": "https://opencode.ai/zen/v1",
+    },
     "huggingface": {
         "model": "google/gemma-2-2b-it",
         "base_url": "https://router.huggingface.co/v1",
@@ -441,6 +445,9 @@ AI_PROVIDER_ALIASES = {
     "hf_router": "huggingface",
     "openai_compat": "openai",
     "openai-compatible": "openai",
+    "zen": "opencode",
+    "opencode_zen": "opencode",
+    "opencode-zen": "opencode",
     "gemini3": "gemini",
     "gemini-3": "gemini",
     "google": "gemini",
@@ -455,6 +462,58 @@ AI_PROVIDER_ALIASES = {
     "cli-codex": "cli_codex",
     "cli-antigravity": "cli_antigravity",
 }
+
+OPENCODE_ZEN_MODELS = [
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-nano",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-haiku-4-5",
+    "claude-3-5-haiku",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro",
+    "gemini-3-flash",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-plus",
+    "qwen3.5-plus",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "minimax-m2.7",
+    "minimax-m2.5",
+    "glm-5.1",
+    "glm-5",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "grok-build-0.1",
+    "big-pickle",
+    "mimo-v2.5-free",
+    "north-mini-code-free",
+    "nemotron-3-ultra-free",
+    "deepseek-v4-flash-free",
+]
 
 AI_MODEL_ALIASES = {
     "gemini": {
@@ -1608,6 +1667,8 @@ def _detect_ai_provider_from_key(api_key: str) -> str:
         return "huggingface"
     if k.startswith("sk-or-"):
         return "openrouter"
+    if k.startswith("sk-oc-") or k.startswith("oc_") or k.startswith("opencode_"):
+        return "opencode"
     if k.startswith("sk-ant-"):
         return "anthropic"
     if k.startswith("gsk_"):
@@ -1627,6 +1688,8 @@ def _resolve_ai_config():
         "TOGETHER_API_KEY",
         "DEEPSEEK_API_KEY",
         "ANTHROPIC_API_KEY",
+        "OPENCODE_API_KEY",
+        "OPENCODE_ZEN_API_KEY",
     )).strip()
 
     provider = _canonical_provider((AI_PROVIDER or "auto"))
@@ -1643,7 +1706,7 @@ def _resolve_ai_config():
     if base_url in ("", "auto"):
         base_url = (preset.get("base_url") or "").strip()
 
-    if provider not in ("gemini", "anthropic", "cli_gemini", "cli_codex", "cli_antigravity"):
+    if provider not in ("gemini", "anthropic", "opencode", "cli_gemini", "cli_codex", "cli_antigravity"):
         if not base_url:
             base_url = (AI_PROVIDER_DEFAULTS.get("openai") or {}).get(
                 "base_url") or "https://api.openai.com/v1"
@@ -1723,6 +1786,130 @@ def _openai_compat_generate_json(api_key: str, base_url: str, model: str, system
     if not txt:
         raise Exception("AI returned empty text")
     return txt, used_model
+
+def _opencode_zen_available_models(api_key: str, base_url: str) -> list[str]:
+    base = (base_url or "").strip().rstrip("/") or "https://opencode.ai/zen/v1"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        with httpx.Client(timeout=min(float(AI_TIMEOUT_SEC), 15.0)) as client:
+            r = client.get(base + "/models", headers=headers)
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        return list(OPENCODE_ZEN_MODELS)
+    models = []
+    for m in (data.get("data") or data.get("models") or []):
+        mid = m.get("id") if isinstance(m, dict) else m
+        if isinstance(mid, str) and mid.strip():
+            models.append(mid.strip().removeprefix("opencode/"))
+    return models or list(OPENCODE_ZEN_MODELS)
+
+def _opencode_zen_generate_json(api_key: str, base_url: str, model: str, system_text: str, user_parts: list[str]):
+    base = (base_url or "").strip().rstrip("/") or "https://opencode.ai/zen/v1"
+    model = (model or "").strip() or (AI_PROVIDER_DEFAULTS.get("opencode") or {}).get("model") or "gpt-5.4-mini"
+    model_id = model.removeprefix("opencode/")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    input_messages = [{"role": "system", "content": system_text}]
+    for p in user_parts:
+        if (p or "").strip():
+            input_messages.append({"role": "user", "content": p})
+
+    if model_id.startswith("gpt-"):
+        url = base + "/responses"
+        payload = {
+            "model": model_id,
+            "input": input_messages,
+            "temperature": float(AI_TEMPERATURE),
+            "max_output_tokens": int(AI_MAX_TOKENS),
+        }
+        parser = "responses"
+    elif model_id.startswith("claude-") or model_id.startswith("qwen"):
+        url = base + "/messages"
+        payload = {
+            "model": model_id,
+            "max_tokens": int(AI_MAX_TOKENS),
+            "temperature": float(AI_TEMPERATURE),
+            "system": system_text,
+            "messages": [m for m in input_messages if m["role"] != "system"],
+        }
+        parser = "messages"
+    elif model_id.startswith("gemini-"):
+        url = base + f"/models/{model_id}:generateContent"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_text}]},
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": p} for p in user_parts if (p or "").strip()],
+                }
+            ],
+            "generationConfig": {
+                "temperature": float(AI_TEMPERATURE),
+                "maxOutputTokens": int(AI_MAX_TOKENS),
+                "responseMimeType": "text/plain",
+            },
+        }
+        parser = "gemini"
+    else:
+        url = base + "/chat/completions"
+        payload = {
+            "model": model_id,
+            "messages": input_messages,
+            "temperature": float(AI_TEMPERATURE),
+            "max_tokens": int(AI_MAX_TOKENS),
+        }
+        parser = "chat"
+
+    for attempt in range(4):
+        with _ai_semaphore:
+            with httpx.Client(timeout=float(AI_TIMEOUT_SEC)) as client:
+                r = client.post(url, json=payload, headers=headers)
+                if parser == "gemini" and r.status_code == 404 and url.endswith(":generateContent"):
+                    r = client.post(base + f"/models/{model_id}", json=payload, headers=headers)
+                try:
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+                except httpx.HTTPStatusError as e:
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise Exception(f"OpenCode Zen HTTP {r.status_code}: {r.text}") from e
+
+    if parser == "responses":
+        txt = str(data.get("output_text") or "").strip()
+        if not txt:
+            parts = []
+            for item in data.get("output") or []:
+                for c in (item.get("content") or []) if isinstance(item, dict) else []:
+                    if isinstance(c, dict):
+                        parts.append(str(c.get("text") or ""))
+            txt = "".join(parts).strip()
+    elif parser == "messages":
+        txt = "".join(
+            str(c.get("text") or "")
+            for c in (data.get("content") or [])
+            if isinstance(c, dict) and c.get("type") in ("text", None)
+        ).strip()
+    elif parser == "gemini":
+        candidates = data.get("candidates") or []
+        content = (candidates[0].get("content") or {}) if candidates else {}
+        txt = "".join(
+            str(p.get("text") or "")
+            for p in (content.get("parts") or [])
+            if isinstance(p, dict)
+        ).strip()
+    else:
+        choices = data.get("choices") or []
+        msg = (choices[0].get("message") or {}) if choices else {}
+        txt = str(msg.get("content") or "").strip()
+
+    if not txt:
+        raise Exception("OpenCode Zen returned empty text")
+    return txt, model_id
 
 def _anthropic_generate_json(api_key: str, model: str, system_text: str, user_parts: list[str]):
     url = "https://api.anthropic.com/v1/messages"
@@ -2700,6 +2887,9 @@ def ai_translate_original_text(original_text_full: str, target_lang: str):
         raw = _gemini_generate_json(api_key, model, system_text, user_parts)
     elif provider == "anthropic":
         raw = _anthropic_generate_json(api_key, model, system_text, user_parts)
+    elif provider == "opencode":
+        raw, used_model = _opencode_zen_generate_json(
+            api_key, base_url, model, system_text, user_parts)
     else:
         raw, used_model = _openai_compat_generate_json(
             api_key, base_url, model, system_text, user_parts)

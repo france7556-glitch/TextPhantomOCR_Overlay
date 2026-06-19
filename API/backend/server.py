@@ -704,6 +704,9 @@ def _generate_ai_raw(provider: str, api_key: str, base_url: str, model: str, sys
         raw = core._anthropic_generate_json(
             api_key, model, system_text, user_parts)
         return raw, model
+    if provider == 'opencode':
+        return core._opencode_zen_generate_json(
+            api_key, base_url, model, system_text, user_parts)
     if _is_hf_provider(provider, base_url):
         return _openai_compat_generate_with_hf_backoff(
             api_key, base_url, model, system_text, user_parts)
@@ -2602,6 +2605,10 @@ async def ai_resolve(payload: Dict[str, Any]):
         elif provider == 'anthropic':
             models = getattr(core, '_anthropic_available_models',
                              lambda _k, _b=None: [])(api_key, base_url)
+
+        elif provider == 'opencode':
+            models = getattr(core, '_opencode_zen_available_models',
+                             lambda _k, _b: [])(api_key, base_url)
 
         elif provider == 'local':
             if not base_url:

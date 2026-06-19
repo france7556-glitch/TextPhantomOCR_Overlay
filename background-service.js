@@ -2015,6 +2015,7 @@ async function getSettings() {
         "maxConcurrency",
         "aiKey",
         "aiModel",
+        "aiProvider",
         "aiBaseUrl",
         "aiPromptByLang",
         "aiPrompt",
@@ -2066,6 +2067,7 @@ async function getSettings() {
           sources: typeof it.sources === "string" ? it.sources : "translated",
           aiKey: typeof it.aiKey === "string" ? it.aiKey : "",
           aiModel,
+          aiProvider: typeof it.aiProvider === "string" ? it.aiProvider : "auto",
           aiBaseUrl: typeof it.aiBaseUrl === "string" ? it.aiBaseUrl : "",
           aiPrompt,
           cliTool: typeof it.cliTool === "string" ? it.cliTool : "cli_gemini",
@@ -2083,7 +2085,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
     const tabSessionId = tab?.id
       ? ensureTabSession(tab.id, tab?.url || "")
       : "";
-    const { mode, lang, sources, aiKey, aiModel, aiBaseUrl, aiPrompt, cliTool, codexEffort } =
+    const { mode, lang, sources, aiKey, aiModel, aiProvider, aiBaseUrl, aiPrompt, cliTool, codexEffort } =
       await getSettings();
     let source =
       mode === "lens_text" ? sources || "translated" : "translated";
@@ -2093,6 +2095,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
         aiPayload = {
           api_key: aiKey || "",
           model: aiModel || "auto",
+          provider: aiProvider || "auto",
           base_url: aiBaseUrl || "auto",
           reasoning_effort: codexEffort || "medium",
           prompt: aiPrompt || "",
