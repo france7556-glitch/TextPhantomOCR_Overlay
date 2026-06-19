@@ -30,6 +30,10 @@ const FIRST_TRY_GAP_MS = 3000;
 
 const REST_POLL_TIMEOUT_MS = 180000;
 const REST_POLL_TIMEOUT_AI_MS = 1900000;
+const REST_LONG_POLL_WAIT_SEC = 25;
+const REST_LONG_POLL_FETCH_GRACE_MS = 7000;
+const REST_POLL_DELAY_MIN_MS = 100;
+const REST_POLL_DELAY_MAX_MS = 5000;
 
 const WARMUP_PATH = "/warmup";
 const WARMUP_TIMEOUT_MS = 2500;
@@ -37,6 +41,8 @@ const WARMUP_TTL_MS = 20 * 60 * 1000;
 
 const CLI_MAX_CONCURRENCY = 10;
 const SOFT_MAX_CONCURRENCY_DEFAULT = 15;
+const SERVER_HINT_CONCURRENCY_MAX = 30;
+const SERVER_HINT_TTL_MS = 60000;
 
 let MAX_CONCURRENCY = 10;
 
@@ -53,6 +59,8 @@ let currentBase = null;
 let currentBatchId = null;
 let blockSendsBecauseWsEnded = false;
 let running = 0;
+let serverRecommendedConcurrency = 0;
+let serverRecommendedConcurrencyTs = 0;
 
 const queue = [];
 const pendingByJob = new Map();
@@ -82,17 +90,82 @@ function isCliSource(source) {
   return String(source || "").trim().toLowerCase().startsWith("cli_");
 }
 
+function clampNumber(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function formatQueueStatus(data) {
+  const kindRaw = String(data?.queue_kind || "").trim().toLowerCase();
+  if (!kindRaw) return "";
+  const kind = kindRaw === "ai" ? "AI" : "Direct";
+  const status = String(data?.status || "").trim().toLowerCase();
+  const stage = String(data?.stage || "").trim();
+  const pos = Number(data?.queue_position || 0);
+  const directDepth = Number(data?.queue_depth_direct || 0);
+  const aiDepth = Number(data?.queue_depth_ai || 0);
+  const totalDepth = Number(data?.queue_depth || 0);
+  const laneDepth = kindRaw === "ai" ? aiDepth : directDepth;
+  if (status === "queued") {
+    const depth = laneDepth || totalDepth || 0;
+    if (pos > 0 && depth > 0) return `${kind} queue #${pos}/${depth}`;
+    if (depth > 0) return `${kind} queue ${depth}`;
+    return `${kind} queue`;
+  }
+  if (status === "running") return stage ? `${kind}: ${stage}` : `${kind}: running`;
+  return "";
+}
+
 function effectiveMaxConcurrency() {
   const soft =
     Number(softMaxConcurrency) > 0
       ? Number(softMaxConcurrency)
       : SOFT_MAX_CONCURRENCY_DEFAULT;
   const n = Number(MAX_CONCURRENCY) || 0;
+  const hint =
+    serverRecommendedConcurrency > 0 &&
+    Date.now() - serverRecommendedConcurrencyTs <= SERVER_HINT_TTL_MS
+      ? serverRecommendedConcurrency
+      : 0;
+  const cap = hint > 0 ? Math.min(soft, hint) : soft;
   if (forceSoftMaxConcurrency) {
-    if (n > 0 && n < soft) return n;
-    return soft;
+    if (n > 0 && n < cap) return n;
+    return cap;
+  }
+  if (hint > 0) {
+    if (n > 0 && n < hint) return n;
+    return hint;
   }
   return n;
+}
+
+function applyServerConcurrencyHint(data) {
+  if (!data || !Object.prototype.hasOwnProperty.call(data, "recommended_client_concurrency"))
+    return;
+  const raw = Number(data.recommended_client_concurrency);
+  if (!Number.isFinite(raw) || raw < 0) return;
+  const prev = serverRecommendedConcurrency;
+  if (raw === 0) {
+    serverRecommendedConcurrency = 0;
+    serverRecommendedConcurrencyTs = 0;
+  } else {
+    serverRecommendedConcurrency = clampNumber(
+      raw,
+      1,
+      SERVER_HINT_CONCURRENCY_MAX,
+      0,
+    );
+    serverRecommendedConcurrencyTs = Date.now();
+  }
+  if (serverRecommendedConcurrency !== prev) {
+    ev("batch.concurrency.hint", {
+      recommended: serverRecommendedConcurrency || "server-managed",
+      effective: effectiveMaxConcurrency() || "unlimited",
+      queueKind: data?.queue_kind || "",
+    });
+    next();
+  }
 }
 
 function aiSoftMaxConcurrencyFromKey(key) {
@@ -811,8 +884,44 @@ async function readLimitedText(res, limit = 1600) {
   }
 }
 
+async function sha256Hex(text) {
+  try {
+    const subtle = globalThis.crypto?.subtle;
+    if (!subtle || typeof TextEncoder === "undefined") return "";
+    const bytes = new TextEncoder().encode(String(text || ""));
+    const hash = await subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(hash))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  } catch {
+    return "";
+  }
+}
+
+async function idempotencyKeyForPayload(payload) {
+  const ai = payload?.ai && typeof payload.ai === "object" ? payload.ai : {};
+  const basis = {
+    src: payload?.src || "",
+    imageDataUri: payload?.imageDataUri || "",
+    mode: payload?.mode || "",
+    lang: payload?.lang || "",
+    source: payload?.source || "",
+    aiProvider: ai.provider || "",
+    aiModel: ai.model || "",
+    aiBaseUrl: ai.base_url || "",
+    aiPrompt: ai.prompt || "",
+    aiReasoningEffort: ai.reasoning_effort || "",
+    pageUrl: payload?.context?.page_url || "",
+  };
+  const hash = await sha256Hex(JSON.stringify(basis));
+  return hash ? `tp:${hash}` : "";
+}
+
 async function submitJobViaRest(base, payload) {
   const url = base.replace(/\/+$/, "") + "/translate";
+  const idempotencyKey = await idempotencyKeyForPayload(payload);
+  const headers = { "Content-Type": "application/json" };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   ev("job.submit.rest.begin", {
     mode: payload?.mode || "",
     lang: payload?.lang || "",
@@ -824,7 +933,7 @@ async function submitJobViaRest(base, payload) {
   });
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     cache: "force-cache",
     redirect: "follow",
     body: JSON.stringify(payload),
@@ -839,6 +948,7 @@ async function submitJobViaRest(base, payload) {
   if (!data?.id) throw new Error("REST submit failed: no id");
   ev("job.submit.rest", {
     id: data.id,
+    idempotent: Boolean(data?.idempotent),
     source: payload?.source || "",
     aiProvider: payload?.ai?.provider || "",
   });
@@ -853,6 +963,7 @@ async function pollJobViaRest(
   const start = Date.now();
   const url =
     base.replace(/\/+$/, "") + "/translate/" + encodeURIComponent(jid);
+  const pollUrl = `${url}?wait=${encodeURIComponent(REST_LONG_POLL_WAIT_SEC)}`;
   let lastSt = null;
   let ticks = 0;
   while (true) {
@@ -888,7 +999,23 @@ async function pollJobViaRest(
     }
 
     if (Date.now() - start > timeoutMs) throw new Error("REST poll timeout");
-    const res = await fetch(url, { cache: "no-store" });
+    const controller = new AbortController();
+    const fetchTimeout = setTimeout(
+      () => controller.abort(),
+      REST_LONG_POLL_WAIT_SEC * 1000 + REST_LONG_POLL_FETCH_GRACE_MS,
+    );
+    let res;
+    try {
+      res = await fetch(pollUrl, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e?.name === "AbortError") throw new Error("REST long-poll timeout");
+      throw e;
+    } finally {
+      clearTimeout(fetchTimeout);
+    }
     if (!res.ok) {
       const body = await readLimitedText(res);
       throw new Error(
@@ -896,18 +1023,29 @@ async function pollJobViaRest(
       );
     }
     const data = await res.json();
+    applyServerConcurrencyHint(data);
     const st = data?.status;
     const ctx = pendingByJob.get(jid);
     if (!ctx) return;
     const isImageMode = String(ctx?.mode || "") === "lens_images";
     const serverStage = String(data?.stage || "").trim();
     const serverStageElapsed = Number(data?.stage_elapsed_ms || 0);
-    if (serverStage && serverStage !== ctx.lastServerStage) {
+    const queueStatus = formatQueueStatus(data);
+    const visibleStage = queueStatus || serverStage;
+    const queueChanged = queueStatus && queueStatus !== ctx.lastQueueStatus;
+    if (queueStatus) ctx.lastQueueStatus = queueStatus;
+    if ((serverStage && serverStage !== ctx.lastServerStage) || queueChanged) {
       ctx.lastServerStage = serverStage;
       ev("job.poll.stage", {
         id: jid,
         status: st || "",
         stage: serverStage,
+        queueStatus,
+        queueKind: data?.queue_kind || "",
+        queuePosition: data?.queue_position || null,
+        queueDepth: data?.queue_depth || 0,
+        queueDepthDirect: data?.queue_depth_direct || 0,
+        queueDepthAi: data?.queue_depth_ai || 0,
         stageElapsedMs: serverStageElapsed || 0,
       });
       const batchId0 = String(
@@ -917,7 +1055,7 @@ async function pollJobViaRest(
         ? ensureBatch(batchId0, ctx.tabId || 0, ctx.frameId || 0)
         : null;
       if (batch0 && !["done", "error", "cache_hit"].includes(serverStage)) {
-        batchUpdateToast(batch0, serverStage);
+        batchUpdateToast(batch0, visibleStage);
       }
     }
     ticks++;
@@ -925,7 +1063,7 @@ async function pollJobViaRest(
       lastSt = st;
       ev("job.poll.status", { id: jid, status: st });
       if (isImageMode)
-        logImageRestAccessLine(base, url, res.status, res.statusText);
+        logImageRestAccessLine(base, pollUrl, res.status, res.statusText);
     } else if (ticks % 15 === 0) {
       ev("job.poll.tick", { id: jid, status: st || "" });
     }
@@ -944,7 +1082,13 @@ async function pollJobViaRest(
       );
       return;
     }
-    await new Promise((r) => setTimeout(r, intervalMs));
+    const nextDelay = clampNumber(
+      data?.poll_after_ms,
+      REST_POLL_DELAY_MIN_MS,
+      REST_POLL_DELAY_MAX_MS,
+      intervalMs,
+    );
+    await new Promise((r) => setTimeout(r, nextDelay));
   }
 }
 
@@ -2125,6 +2269,8 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
     softMaxConcurrency = forceSoftMaxConcurrency
       ? softConcurrencyForSource(source, aiKey)
       : SOFT_MAX_CONCURRENCY_DEFAULT;
+    serverRecommendedConcurrency = 0;
+    serverRecommendedConcurrencyTs = 0;
     ev("batch.concurrency", {
       soft: softMaxConcurrency,
       max: MAX_CONCURRENCY || "unlimited",

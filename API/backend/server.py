@@ -10,6 +10,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 SERVER_MAX_WORKERS = int(os.environ.get('SERVER_MAX_WORKERS', '15'))
+_DEFAULT_AI_WORKERS = 2 if SERVER_MAX_WORKERS >= 8 else 1
+TP_AI_MAX_CONCURRENCY = max(
+    1, int(os.environ.get('TP_AI_MAX_CONCURRENCY', str(_DEFAULT_AI_WORKERS))))
+TP_DIRECT_MAX_CONCURRENCY = max(
+    1, int(os.environ.get(
+        'TP_DIRECT_MAX_CONCURRENCY',
+        str(max(1, SERVER_MAX_WORKERS - TP_AI_MAX_CONCURRENCY)),
+    )))
 JOB_TTL_SEC = int(os.environ.get('JOB_TTL_SEC', '3600'))
 HTTP_TIMEOUT_SEC = float(os.environ.get(
     'HTTP_TIMEOUT_SEC', str(getattr(core, 'AI_TIMEOUT_SEC', 120))))
@@ -19,6 +27,8 @@ TP_DEBUG = str(os.environ.get('TP_DEBUG', '')).strip(
 ).lower() in ('1', 'true', 'yes', 'on')
 TP_TRACE = str(os.environ.get('TP_TRACE', '1')).strip(
 ).lower() in ('1', 'true', 'yes', 'on')
+TP_LONG_POLL_MAX_WAIT_SEC = max(
+    0.0, float(os.environ.get('TP_LONG_POLL_MAX_WAIT_SEC', '25')))
 
 TP_PARA_MARKER_PREFIX = '<<TP_P'
 TP_PARA_MARKER_SUFFIX = '>>'
@@ -41,7 +51,9 @@ TP_TILE_DEDUPE_TEXT_SIM = max(
 _result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _ai_result_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _jobs: Dict[str, Dict[str, Any]] = {}
-_job_queue: asyncio.Queue = asyncio.Queue()
+_idempotency_keys: Dict[str, str] = {}
+_direct_queue: asyncio.Queue = asyncio.Queue()
+_ai_queue: asyncio.Queue = asyncio.Queue()
 _jobs_lock = Lock()
 _CURRENT_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar('tp_job_id', default='')
 _result_cache_lock = Lock()
@@ -129,6 +141,38 @@ def _update_job(jid: str, **fields) -> None:
         cur['ts'] = now
         _jobs[jid] = cur
 
+def _queue_kind_for_payload(payload: Dict[str, Any]) -> str:
+    mode = str((payload or {}).get('mode') or '').strip().lower()
+    source = str((payload or {}).get('source') or '').strip().lower()
+    if mode == 'lens_text' and (source == 'ai' or source.startswith('cli_')):
+        return 'ai'
+    return 'direct'
+
+def _queue_for_kind(kind: str) -> asyncio.Queue:
+    return _ai_queue if str(kind or '').strip().lower() == 'ai' else _direct_queue
+
+def _poll_after_ms(status: str, queue_depth: int) -> int:
+    if status in ('done', 'error'):
+        return 0
+    if queue_depth > 20:
+        return 1500
+    if queue_depth > 5:
+        return 800
+    if status == 'running':
+        return 500
+    return 400
+
+def _normalize_idempotency_key(value: str) -> str:
+    key = str(value or '').strip()
+    if not key or len(key) > 256:
+        return ''
+    if not re.fullmatch(r'[A-Za-z0-9._:-]+', key):
+        return ''
+    return key
+
+def _job_exists_locked(jid: str) -> bool:
+    return bool(jid and _jobs.get(jid))
+
 def _set_current_job_stage(stage: str, detail: Optional[Dict[str, Any]] = None) -> None:
     stage = str(stage or '').strip()
     if not stage:
@@ -154,11 +198,46 @@ def _snapshot_job(jid: str) -> Optional[Dict[str, Any]]:
         if not j:
             return None
         out = dict(j)
+        queued_jobs = [
+            (
+                qid,
+                str((q.get('queue_kind') or 'direct')).strip() or 'direct',
+                float(q.get('queued_at') or q.get('ts') or 0),
+            )
+            for qid, q in _jobs.items()
+            if str(q.get('status') or '') == 'queued'
+        ]
     now = _now()
     started = float(out.get('started_at') or out.get('ts') or now)
     stage_started = float(out.get('stage_started_at') or started)
     out['elapsed_ms'] = round((now - started) * 1000, 1)
     out['stage_elapsed_ms'] = round((now - stage_started) * 1000, 1)
+    queue_kind = str(out.get('queue_kind') or 'direct').strip() or 'direct'
+    queued_jobs.sort(key=lambda item: (item[2], item[0]))
+    same_kind = [item for item in queued_jobs if item[1] == queue_kind]
+    queue_position = None
+    if str(out.get('status') or '') == 'queued':
+        for idx, item in enumerate(same_kind, start=1):
+            if item[0] == jid:
+                queue_position = idx
+                break
+    queue_depth_direct = sum(1 for item in queued_jobs if item[1] == 'direct')
+    queue_depth_ai = sum(1 for item in queued_jobs if item[1] == 'ai')
+    queue_depth = len(queued_jobs)
+    queue_depth_lane = queue_depth_ai if queue_kind == 'ai' else queue_depth_direct
+    out['queue_kind'] = queue_kind
+    out['queue_position'] = queue_position
+    out['queue_depth'] = queue_depth
+    out['queue_depth_direct'] = queue_depth_direct
+    out['queue_depth_ai'] = queue_depth_ai
+    out['direct_workers'] = TP_DIRECT_MAX_CONCURRENCY
+    out['ai_workers'] = TP_AI_MAX_CONCURRENCY
+    out['poll_after_ms'] = _poll_after_ms(
+        str(out.get('status') or ''), queue_depth_lane)
+    out['recommended_client_concurrency'] = (
+        TP_AI_MAX_CONCURRENCY if queue_kind == 'ai' else TP_DIRECT_MAX_CONCURRENCY
+    )
+    out['server_time'] = now
     return out
 
 def _trace(tag: str, data=None) -> None:
@@ -2241,13 +2320,22 @@ async def _cleanup_jobs_loop():
                 j.get('ts', 0)) < cutoff]
             for jid in dead:
                 _jobs.pop(jid, None)
+            if dead:
+                dead_set = set(dead)
+                stale_keys = [
+                    key for key, jid in _idempotency_keys.items()
+                    if jid in dead_set or jid not in _jobs
+                ]
+                for key in stale_keys:
+                    _idempotency_keys.pop(key, None)
 
-async def _worker_loop(worker_id: int):
+async def _worker_loop(worker_id: int, kind: str, queue: asyncio.Queue):
     while True:
-        jid, payload = await _job_queue.get()
+        jid, payload = await queue.get()
         try:
             _trace('job.running', {
                 'id': jid,
+                'queue_kind': kind,
                 'worker': worker_id,
                 'mode': str(payload.get('mode') or ''),
                 'lang': str(payload.get('lang') or ''),
@@ -2257,7 +2345,7 @@ async def _worker_loop(worker_id: int):
                 'has_src': bool(payload.get('src')),
             })
             started_at = _now()
-            _update_job(jid, status='running', stage='starting',
+            _update_job(jid, status='running', stage='starting', queue_kind=kind,
                         started_at=started_at, stage_started_at=started_at)
             token = _CURRENT_JOB_ID.set(jid)
             try:
@@ -2268,6 +2356,7 @@ async def _worker_loop(worker_id: int):
                         stage_started_at=_now())
             _trace('job.done', {
                 'id': jid,
+                'queue_kind': kind,
                 'worker': worker_id,
                 'result_keys': list(result.keys()) if isinstance(result, dict) else [],
                 'has_ai_text': bool(isinstance(result, dict) and (result.get('AiTextFull') or (result.get('Ai') or {}).get('aiTextFull'))),
@@ -2278,11 +2367,12 @@ async def _worker_loop(worker_id: int):
                         result=str(e), stage_started_at=_now())
             _trace('job.error', {
                 'id': jid,
+                'queue_kind': kind,
                 'worker': worker_id,
                 'error': str(e),
             })
         finally:
-            _job_queue.task_done()
+            queue.task_done()
 
 def _process_payload(payload: dict) -> dict:
     t_all = time.perf_counter()
@@ -2441,9 +2531,11 @@ def _process_payload(payload: dict) -> dict:
 @app.on_event('startup')
 async def _startup():
     print(
-        f'[TextPhantom][api] starting build={BUILD_ID} workers={SERVER_MAX_WORKERS}')
-    for i in range(max(1, SERVER_MAX_WORKERS)):
-        asyncio.create_task(_worker_loop(i))
+        f'[TextPhantom][api] starting build={BUILD_ID} direct_workers={TP_DIRECT_MAX_CONCURRENCY} ai_workers={TP_AI_MAX_CONCURRENCY}')
+    for i in range(TP_DIRECT_MAX_CONCURRENCY):
+        asyncio.create_task(_worker_loop(i, 'direct', _direct_queue))
+    for i in range(TP_AI_MAX_CONCURRENCY):
+        asyncio.create_task(_worker_loop(i, 'ai', _ai_queue))
     asyncio.create_task(_cleanup_jobs_loop())
 
 @app.get('/health')
@@ -2473,10 +2565,27 @@ async def meta():
     return {'ok': True, 'languages': langs, 'sources': sources, 'has_env_ai_key': bool(env_key)}
 
 @app.post('/translate')
-async def translate(payload: Dict[str, Any]):
+async def translate(payload: Dict[str, Any], request: Request):
+    idempotency_key = _normalize_idempotency_key(
+        request.headers.get('Idempotency-Key', ''))
+    if idempotency_key:
+        with _jobs_lock:
+            existing_id = _idempotency_keys.get(idempotency_key, '')
+            if _job_exists_locked(existing_id):
+                existing = _jobs.get(existing_id) or {}
+                return {
+                    'id': existing_id,
+                    'idempotent': True,
+                    'status': existing.get('status') or 'queued',
+                }
+            if existing_id:
+                _idempotency_keys.pop(idempotency_key, None)
     jid = str(uuid.uuid4())
+    queue_kind = _queue_kind_for_payload(payload)
     _trace('rest.enqueue', {
         'id': jid,
+        'idempotency': bool(idempotency_key),
+        'queue_kind': queue_kind,
         'mode': str(payload.get('mode') or ''),
         'lang': str(payload.get('lang') or ''),
         'source': str(payload.get('source') or ''),
@@ -2494,16 +2603,56 @@ async def translate(payload: Dict[str, Any]):
         'has_src': bool(payload.get('src')),
     })
     now = _now()
-    _update_job(jid, status='queued', stage='queued',
-                queued_at=now, stage_started_at=now)
-    await _job_queue.put((jid, payload))
+    with _jobs_lock:
+        if idempotency_key:
+            existing_id = _idempotency_keys.get(idempotency_key, '')
+            if _job_exists_locked(existing_id):
+                existing = _jobs.get(existing_id) or {}
+                return {
+                    'id': existing_id,
+                    'idempotent': True,
+                    'status': existing.get('status') or 'queued',
+                }
+        _jobs[jid] = {
+            'status': 'queued',
+            'stage': 'queued',
+            'queue_kind': queue_kind,
+            'queued_at': now,
+            'stage_started_at': now,
+            'idempotency_key': idempotency_key or None,
+            'ts': now,
+        }
+        if idempotency_key:
+            _idempotency_keys[idempotency_key] = jid
+    await _queue_for_kind(queue_kind).put((jid, payload))
     return {'id': jid}
 
 @app.get('/translate/{job_id}')
-async def translate_status(job_id: str):
+async def translate_status(job_id: str, wait: float = 0.0):
+    try:
+        wait = float(wait or 0.0)
+    except Exception:
+        wait = 0.0
+    wait = max(0.0, min(wait, TP_LONG_POLL_MAX_WAIT_SEC))
     j = _snapshot_job(job_id)
     if not j:
         return {'status': 'error', 'result': 'job_not_found'}
+    if wait > 0 and str(j.get('status') or '') not in ('done', 'error'):
+        deadline = _now() + wait
+        initial_status = str(j.get('status') or '')
+        initial_stage = str(j.get('stage') or '')
+        while _now() < deadline:
+            await asyncio.sleep(min(0.25, max(0.0, deadline - _now())))
+            cur = _snapshot_job(job_id)
+            if not cur:
+                return {'status': 'error', 'result': 'job_not_found'}
+            cur_status = str(cur.get('status') or '')
+            cur_stage = str(cur.get('stage') or '')
+            if cur_status in ('done', 'error') or cur_status != initial_status or cur_stage != initial_stage:
+                return cur
+        j = _snapshot_job(job_id)
+        if not j:
+            return {'status': 'error', 'result': 'job_not_found'}
     return j
 
 @app.post('/ai/resolve')
