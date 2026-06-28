@@ -22,6 +22,7 @@ JOB_TTL_SEC = int(os.environ.get('JOB_TTL_SEC', '3600'))
 HTTP_TIMEOUT_SEC = float(os.environ.get(
     'HTTP_TIMEOUT_SEC', str(getattr(core, 'AI_TIMEOUT_SEC', 120))))
 SUPPORTED_MODES = {"lens_images", "lens_text"}
+SUPPORTED_OCR_ENGINES = {"google_lens", "paddleocr"}
 BUILD_ID = os.environ.get('TP_BUILD_ID', 'v9-backendfix-20260129')
 TP_DEBUG = str(os.environ.get('TP_DEBUG', '')).strip(
 ).lower() in ('1', 'true', 'yes', 'on')
@@ -485,9 +486,15 @@ def _ai_prompt_sig(s: str) -> str:
         return ''
     return hashlib.sha256(t.encode('utf-8')).hexdigest()[:12]
 
-def _build_cache_key(img_hash: str, lang: str, mode: str, source: str, ai_cfg: Optional["AiConfig"]) -> str:
+def _normalize_ocr_engine(value: str) -> str:
+    v = str(value or '').strip().lower().replace('-', '_')
+    if v in ('paddle', 'paddle_ocr', 'paddleocr'):
+        return 'paddleocr'
+    return 'google_lens'
+
+def _build_cache_key(img_hash: str, lang: str, mode: str, source: str, ai_cfg: Optional["AiConfig"], ocr_engine: str = 'google_lens') -> str:
     parts = [img_hash, _normalize_lang(
-        lang), (mode or '').strip(), (source or '').strip()]
+        lang), (mode or '').strip(), (source or '').strip(), _normalize_ocr_engine(ocr_engine)]
     if ai_cfg:
         parts.extend([
             (ai_cfg.provider or '').strip(),
@@ -888,11 +895,12 @@ def ai_translate_text(original_text_full: str, target_lang: str, ai: AiConfig, i
         },
     }
 
-def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
+def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig], ocr_engine: str = 'google_lens') -> dict:
     t_total = time.perf_counter()
     mode_id = (mode or '').strip()
     if mode_id not in SUPPORTED_MODES:
         mode_id = 'lens_images'
+    ocr_engine = _normalize_ocr_engine(ocr_engine)
 
     target_lang = _normalize_lang(lang)
 
@@ -900,18 +908,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
         'mode': mode_id,
         'lang': target_lang,
         'ai': bool(ai_cfg),
-    })
-
-    t_stage = time.perf_counter()
-    data = core.get_lens_data_from_image(
-        image_path, getattr(core, 'FIREBASE_URL', ''), target_lang)
-    _trace('image.single.stage', {
-        'stage': 'lens_ocr',
-        'ms': _elapsed_ms(t_stage),
-        'has_original_text': bool(isinstance(data, dict) and data.get('originalTextFull')),
-        'has_translated_text': bool(isinstance(data, dict) and data.get('translatedTextFull')),
-        'original_paras': len((data.get('originalParagraphs') or []) if isinstance(data, dict) else []),
-        'translated_paras': len((data.get('translatedParagraphs') or []) if isinstance(data, dict) else []),
+        'ocr_engine': ocr_engine,
     })
 
     t_stage = time.perf_counter()
@@ -922,6 +919,38 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
         'ms': _elapsed_ms(t_stage),
         'w': W,
         'h': H,
+    })
+
+    t_stage = time.perf_counter()
+    paddle_original_tree = None
+    ocr_meta = {}
+    if ocr_engine == 'paddleocr':
+        from backend import ocr_paddle
+        paddle = ocr_paddle.run_paddle_ocr(image_path, target_lang, W, H)
+        paddle_original_tree = paddle.get('originalTree') if isinstance(paddle, dict) else None
+        ocr_meta = (paddle.get('meta') if isinstance(paddle, dict) else {}) or {}
+        data = {
+            'imageUrl': None,
+            'originalContentLanguage': None,
+            'originalTextFull': (paddle.get('originalTextFull') or '') if isinstance(paddle, dict) else '',
+            'translatedTextFull': '',
+            'originalParagraphs': [],
+            'translatedParagraphs': [],
+        }
+        stage_name = 'paddle_ocr'
+    else:
+        data = core.get_lens_data_from_image(
+            image_path, getattr(core, 'FIREBASE_URL', ''), target_lang)
+        stage_name = 'lens_ocr'
+    _trace('image.single.stage', {
+        'stage': stage_name,
+        'ms': _elapsed_ms(t_stage),
+        'ocr_engine': ocr_engine,
+        'has_original_text': bool(isinstance(data, dict) and data.get('originalTextFull')),
+        'has_translated_text': bool(isinstance(data, dict) and data.get('translatedTextFull')),
+        'original_paras': len((data.get('originalParagraphs') or []) if isinstance(data, dict) else []),
+        'translated_paras': len((data.get('translatedParagraphs') or []) if isinstance(data, dict) else []),
+        'meta': ocr_meta,
     })
 
     t_stage = time.perf_counter()
@@ -959,6 +988,7 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
 
     out: Dict[str, Any] = {
         'mode': mode_id,
+        'ocrEngine': ocr_engine,
         'imageUrl': image_url,
         'imageDataUri': '',
         'originalContentLanguage': data.get('originalContentLanguage') if isinstance(data, dict) else None,
@@ -1012,20 +1042,24 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
 
     if getattr(core, 'DO_ORIGINAL', True):
         t_stage = time.perf_counter()
-        tree, _ = core.decode_tree(
-            out.get('originalParagraphs') or [],
-            out.get('originalTextFull') or '',
-            'original',
-            W,
-            H,
-            want_raw=False,
-        )
+        if ocr_engine == 'paddleocr':
+            tree = paddle_original_tree if isinstance(paddle_original_tree, dict) else {'side': 'original', 'paragraphs': []}
+        else:
+            tree, _ = core.decode_tree(
+                out.get('originalParagraphs') or [],
+                out.get('originalTextFull') or '',
+                'original',
+                W,
+                H,
+                want_raw=False,
+            )
         original_tree = tree
         original_span_tokens = core.flatten_tree_spans(tree)
         _dbg('tree.original', _tree_stats(original_tree))
         out['original'] = {
             'originalTree': tree,
             'originalTextFull': out.get('originalTextFull') or '',
+            'meta': ocr_meta if ocr_engine == 'paddleocr' else {},
         }
         _trace('image.single.stage', {
             'stage': 'decode_original_tree',
@@ -1035,14 +1069,17 @@ def _process_image_path_single(image_path: str, lang: str, mode: str, ai_cfg: Op
 
     if getattr(core, 'DO_TRANSLATED', True):
         t_stage = time.perf_counter()
-        tree, _ = core.decode_tree(
-            out.get('translatedParagraphs') or [],
-            out.get('translatedTextFull') or '',
-            'translated',
-            W,
-            H,
-            want_raw=False,
-        )
+        if ocr_engine == 'paddleocr':
+            tree = {'side': 'translated', 'paragraphs': []}
+        else:
+            tree, _ = core.decode_tree(
+                out.get('translatedParagraphs') or [],
+                out.get('translatedTextFull') or '',
+                'translated',
+                W,
+                H,
+                want_raw=False,
+            )
         translated_tree = tree
         translated_span_tokens = core.flatten_tree_spans(tree)
         _dbg('tree.translated', _tree_stats(translated_tree))
@@ -1932,14 +1969,14 @@ def _dedupe_tree_paragraphs(tree: dict, W: int, H: int, tile_ranges: list = None
     _reindex_tree_paragraphs(tree)
     return {'removed': removed, 'merged': merged_count}
 
-def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig]) -> dict:
+def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[AiConfig], ocr_engine: str = 'google_lens') -> dict:
     t_total = time.perf_counter()
     img = core.Image.open(image_path)
     W, H = img.size
     MAX_H = TP_TILE_MAX_H
     
     if H <= MAX_H:
-        out = _process_image_path_single(image_path, lang, mode, ai_cfg)
+        out = _process_image_path_single(image_path, lang, mode, ai_cfg, ocr_engine)
         _trace('image.process.done', {
             'split': False,
             'w': W,
@@ -1955,6 +1992,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         'max_h': MAX_H,
         'overlap_px': TP_TILE_OVERLAP_PX,
         'mode': mode,
+        'ocr_engine': _normalize_ocr_engine(ocr_engine),
         'ai': bool(ai_cfg),
     })
     tiles = _build_vertical_tiles(img, MAX_H)
@@ -1986,7 +2024,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
             tmp_tile_path = f.name
             save_ms = _elapsed_ms(t_save)
         try:
-            res = _process_image_path_single(tmp_tile_path, lang, mode, tile_ai_cfg)
+            res = _process_image_path_single(tmp_tile_path, lang, mode, tile_ai_cfg, ocr_engine)
             results.append((offset_y, tile_h, res))
             _trace('image.tile.done', {
                 'index': tile_index,
@@ -2017,6 +2055,7 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
     raw_original_text = []
     raw_translated_text = []
     raw_ai_text = []
+    ocr_tile_metas = []
     
     merged_images = []
     
@@ -2029,6 +2068,13 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
             raw_translated_text.append(str(res['translatedTextFull']).strip())
         if res.get('AiTextFull'):
             raw_ai_text.append(str(res['AiTextFull']).strip())
+        if _normalize_ocr_engine(ocr_engine) == 'paddleocr':
+            try:
+                meta0 = ((res.get('original') or {}).get('meta') or {})
+                if isinstance(meta0, dict):
+                    ocr_tile_metas.append(meta0)
+            except Exception:
+                pass
 
         # Shift and merge trees
         for tree_key, result_tree_key, role in [
@@ -2078,6 +2124,29 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
         'tiles': [{'y': int(y), 'h': int(h)} for y, h, _ in tiles],
         'dedupe': dedupe_meta,
     }
+    if _normalize_ocr_engine(ocr_engine) == 'paddleocr' and ocr_tile_metas:
+        raw_boxes = sum(int(m.get('raw_boxes') or 0) for m in ocr_tile_metas)
+        boxes = sum(int(m.get('boxes') or 0) for m in ocr_tile_metas)
+        weighted_conf_sum = sum(float(m.get('avg_confidence') or 0.0) * int(m.get('boxes') or 0) for m in ocr_tile_metas)
+        resize_metas = [m.get('resize') for m in ocr_tile_metas if isinstance(m.get('resize'), dict)]
+        ocr_meta = {
+            'engine': 'paddleocr',
+            'split': True,
+            'tiles': len(results),
+            'raw_boxes': raw_boxes,
+            'boxes': boxes,
+            'paragraphs_before_dedupe': sum(int(m.get('paragraphs') or 0) for m in ocr_tile_metas),
+            'paragraphs': len(merged_original_tree.get('paragraphs') or []),
+            'avg_confidence': round(weighted_conf_sum / boxes, 4) if boxes else 0.0,
+            'lang': next((str(m.get('lang') or '') for m in ocr_tile_metas if m.get('lang')), ''),
+            'min_confidence': next((m.get('min_confidence') for m in ocr_tile_metas if m.get('min_confidence') is not None), None),
+            'max_concurrency': next((m.get('max_concurrency') for m in ocr_tile_metas if m.get('max_concurrency') is not None), None),
+            'resize': {
+                'resized_tiles': sum(1 for r in resize_metas if r.get('resized')),
+                'tiles': resize_metas,
+            },
+        }
+        merged['splitMeta']['ocr'] = ocr_meta
 
     merged_original_text = _tree_to_paragraph_texts(merged_original_tree)
     merged_translated_text = _tree_to_paragraph_texts(merged_translated_tree)
@@ -2096,6 +2165,8 @@ def process_image_path(image_path: str, lang: str, mode: str, ai_cfg: Optional[A
     if 'original' in merged and isinstance(merged['original'], dict):
         merged['original']['originalTree'] = merged_original_tree
         merged['original']['originalTextFull'] = merged['originalTextFull']
+        if _normalize_ocr_engine(ocr_engine) == 'paddleocr' and ocr_tile_metas:
+            merged['original']['meta'] = merged.get('splitMeta', {}).get('ocr') or merged['original'].get('meta', {})
     if 'translated' in merged and isinstance(merged['translated'], dict):
         merged['translated']['translatedTree'] = merged_translated_tree
         merged['translated']['translatedTextFull'] = merged['translatedTextFull']
@@ -2378,6 +2449,7 @@ def _process_payload(payload: dict) -> dict:
     t_all = time.perf_counter()
     mode = (payload.get('mode') or 'lens_images')
     lang = (payload.get('lang') or 'en')
+    ocr_engine = _normalize_ocr_engine(payload.get('ocrEngine') or payload.get('ocr_engine') or os.environ.get('TP_OCR_ENGINE_DEFAULT', 'google_lens'))
 
     context = payload.get('context') if isinstance(
         payload.get('context'), dict) else {}
@@ -2389,6 +2461,7 @@ def _process_payload(payload: dict) -> dict:
     _trace('payload.start', {
         'mode': mode,
         'lang': lang,
+        'ocr_engine': ocr_engine,
         'source': str(payload.get('source') or ''),
         'has_datauri': bool(payload.get('imageDataUri')),
         'src_prefix': src[:80],
@@ -2458,14 +2531,14 @@ def _process_payload(payload: dict) -> dict:
     if mode == 'lens_text' and img_hash:
         cache_source = source if is_ai_source else 'text'
         cache_key = _build_cache_key(
-            img_hash, lang, mode, cache_source, ai_cfg)
+            img_hash, lang, mode, cache_source, ai_cfg, ocr_engine)
         cached = None
         if is_ai_source:
             cached = _lru_get(_ai_result_cache, _ai_cache_lock, cache_key)
         else:
             cached = _lru_get(_result_cache, _result_cache_lock, cache_key)
         if cached:
-            _trace('payload.cache.hit', {'source': source, 'cache_key_len': len(cache_key)})
+            _trace('payload.cache.hit', {'source': source, 'ocr_engine': ocr_engine, 'cache_key_len': len(cache_key)})
             cached['perf'] = {
                 'cache': 'hit',
                 'total_ms': round((time.perf_counter() - t_all) * 1000, 1),
@@ -2483,10 +2556,11 @@ def _process_payload(payload: dict) -> dict:
         'source': source,
         'mode': mode,
         'lang': lang,
+        'ocr_engine': ocr_engine,
     })
     try:
         try:
-            out = process_image_path(tmp_path, lang, mode, ai_cfg)
+            out = process_image_path(tmp_path, lang, mode, ai_cfg, ocr_engine)
         except Exception as e:
             err_str = str(e).lower()
             if any(kw in err_str for kw in ('ai ', 'ai_', 'openai', 'gemini', 'anthropic', 'api_key', 'api key',
@@ -2502,6 +2576,7 @@ def _process_payload(payload: dict) -> dict:
                 raise Exception(f'[render] {e}') from e
         _trace('payload.process.done', {
             'source': source,
+            'ocr_engine': ocr_engine,
             'has_original_text': bool(isinstance(out, dict) and out.get('originalTextFull')),
             'has_translated_text': bool(isinstance(out, dict) and out.get('translatedTextFull')),
             'has_ai_text': bool(isinstance(out, dict) and (out.get('AiTextFull') or (out.get('Ai') or {}).get('aiTextFull'))),
@@ -2547,10 +2622,15 @@ async def version():
     return {'ok': True, 'build': BUILD_ID, 'core': 'lens_core'}
 
 @app.get('/warmup')
-async def warmup(lang: str = TP_WARMUP_LANG):
+async def warmup(lang: str = TP_WARMUP_LANG, ocr_engine: str = 'google_lens'):
     t0 = time.perf_counter()
-    r = core.warmup(lang)
-    return {'ok': True, 'build': BUILD_ID, 'dt_ms': round((time.perf_counter() - t0) * 1000, 1), 'result': r}
+    engine = _normalize_ocr_engine(ocr_engine)
+    if engine == 'paddleocr':
+        from backend import ocr_paddle
+        r = ocr_paddle.warmup_paddle_ocr(lang)
+    else:
+        r = core.warmup(lang)
+    return {'ok': True, 'build': BUILD_ID, 'ocrEngine': engine, 'dt_ms': round((time.perf_counter() - t0) * 1000, 1), 'result': r}
 
 @app.get('/meta')
 async def meta():

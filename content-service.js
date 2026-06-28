@@ -236,18 +236,37 @@
   async function getSettings() {
     return new Promise((res) => {
       chrome.storage.local.get(
-        ["mode", "lang", "sources", "aiKey"],
+        ["mode", "lang", "sources", "ocrEngine", "aiKey"],
         (items) => {
+          const mode = typeof items.mode === "string" ? items.mode : "lens_images";
+          const rawSource =
+            typeof items.sources === "string" ? items.sources : "translated";
+          const rawEngine =
+            typeof items.ocrEngine === "string" ? items.ocrEngine : "google_lens";
+          const ocrEngine = normalizeOcrEngineForMode(mode, rawEngine);
           res({
-            mode: typeof items.mode === "string" ? items.mode : "lens_images",
+            mode,
             lang: typeof items.lang === "string" ? items.lang : "th",
-            sources:
-              typeof items.sources === "string" ? items.sources : "translated",
+            sources: normalizeSourceForOcr(mode, rawSource, ocrEngine),
+            ocrEngine,
             aiKey: typeof items.aiKey === "string" ? items.aiKey : "",
           });
         },
       );
     });
+  }
+
+  function normalizeOcrEngineForMode(mode, ocrEngine) {
+    const engine = String(ocrEngine || "").trim().toLowerCase().replace(/-/g, "_");
+    return mode === "lens_text" && engine === "paddleocr" ? "paddleocr" : "google_lens";
+  }
+
+  function normalizeSourceForOcr(mode, source, ocrEngine) {
+    const s = String(source || "").trim() || "translated";
+    if (mode === "lens_text" && ocrEngine === "paddleocr" && s === "translated") {
+      return "original";
+    }
+    return s;
   }
 
   function removeLazyScriptsAndForceSrc() {
@@ -459,6 +478,7 @@
     img,
     mode,
     lang,
+    ocrEngine = "google_lens",
     menuSource = "page_scan",
     customStage,
     includeDataUri = false,
@@ -476,6 +496,7 @@
       },
       mode,
       lang,
+      ocrEngine,
       menuSource,
       customStage,
     );
@@ -505,7 +526,7 @@
       img.decoding = "sync";
     });
   }
-  async function collectImagesForScan(mode, lang, sourceTag) {
+  async function collectImagesForScan(mode, lang, ocrEngine, sourceTag) {
     const seen = new Set();
     const imgs = Array.from(document.images || []);
     const out = [];
@@ -523,7 +544,7 @@
         if (Math.min(w, h) < 120) continue;
         if (w * h < 60000) continue;
       }
-      const payload = await buildPayloadFromImage(img, mode, lang, sourceTag);
+      const payload = await buildPayloadFromImage(img, mode, lang, ocrEngine, sourceTag);
       const key = _normUrl(payload?.src) || String(payload?.metadata?.image_id || "");
       if (!key || seen.has(key)) continue;
       seen.add(key);
@@ -543,17 +564,24 @@
       }
     });
 
-  const mdCacheGet = (keys, includeNewImg = false, lang = "", mode = "") =>
+  const mdCacheGet = (
+    keys,
+    includeNewImg = false,
+    lang = "",
+    mode = "",
+    ocrEngine = "google_lens",
+  ) =>
     sendBg({
       type: "TP_MD_CACHE_GET",
       keys,
       includeNewImg: !!includeNewImg,
       lang,
       mode,
+      ocrEngine,
     });
 
-  const mdCacheGetNewImg = async (key, lang, mode) => {
-    const resp = await mdCacheGet([key], true, lang, mode);
+  const mdCacheGetNewImg = async (key, lang, mode, ocrEngine = "google_lens") => {
+    const resp = await mdCacheGet([key], true, lang, mode, ocrEngine);
     const rec = resp?.items?.[key] || null;
     return (
       rec?.newImg ||
@@ -570,8 +598,9 @@
     imgElement,
     lang,
     mode,
+    ocrEngine = "google_lens",
   ) => {
-    mdCacheGetNewImg(key, lang, mode).then((newSrc) => {
+    mdCacheGetNewImg(key, lang, mode, ocrEngine).then((newSrc) => {
       if (!newSrc) return;
       if (isTextMode) {
         const mdKey = mdKeyFromUrl(originalUrl);
@@ -1001,6 +1030,7 @@
     { original_image_url, position, imageDataUri },
     mode,
     lang,
+    ocrEngine = "google_lens",
     menuSource = "page_scan",
     customStage,
   ) {
@@ -1011,6 +1041,7 @@
     const payload = {
       mode,
       lang,
+      ocrEngine,
       type: "image",
       src: original_image_url || null,
       imageDataUri: imageDataUri || null,
@@ -1022,6 +1053,7 @@
       metadata: {
         image_id: crypto.randomUUID(),
         original_image_url: original_image_url || null,
+        ocrEngine,
         position,
         pipeline,
         ocr_image: null,
@@ -1034,6 +1066,7 @@
       menu: menuSource,
       mode,
       lang,
+      ocrEngine,
     });
     return payload;
   }
@@ -1191,7 +1224,7 @@
 
     const st = await getSettings();
 
-    const resp = await mdCacheGet(keys, false, st.lang, st.mode);
+    const resp = await mdCacheGet(keys, false, st.lang, st.mode, st.ocrEngine);
 
     const items = resp?.items || null;
     if (!items) return null;
@@ -1219,13 +1252,14 @@
       if (hasNewImg) {
         const img = findTargetImage(p.url);
         if (img)
-          mdApplyCachedNewImg(p.url, p.key, isText, img, st.lang, st.mode);
+          mdApplyCachedNewImg(p.url, p.key, isText, img, st.lang, st.mode, st.ocrEngine);
         else
           mdRememberPending(p.url, {
             needNewImg: true,
             needMode: isText ? "clean" : "replace",
             needLang: st.lang,
             needCacheMode: st.mode,
+            needOcrEngine: st.ocrEngine,
           });
       }
     }
@@ -1347,6 +1381,7 @@
           img,
           pending.needLang,
           pending.needCacheMode,
+          pending.needOcrEngine,
         );
     }
   }
@@ -2072,7 +2107,7 @@
         sendResp({ ok: true });
         return;
       }
-      const { mode, lang, sources } = await getSettings();
+      const { mode, lang, sources, ocrEngine } = await getSettings();
       const source = String(mode || "").includes("text") ? String(sources || "translated") : "translated";
       try {
         log.debug("MSG", {
@@ -2142,6 +2177,7 @@
                 { original_image_url: u, position: posBySrc.get(u) || null },
                 mode,
                 lang,
+                ocrEngine,
                 "page_scan",
                 "collected_mangadex_api",
               ),
@@ -2156,6 +2192,7 @@
                 { original_image_url: src, position: pos || null },
                 mode,
                 lang,
+                ocrEngine,
                 "page_scan",
                 "collected_mangadex_dom",
               ),
@@ -2164,7 +2201,7 @@
 
           infos = all.filter(Boolean);
         } else {
-          infos = await collectImagesForScan(mode, lang, "page_scan");
+          infos = await collectImagesForScan(mode, lang, ocrEngine, "page_scan");
         }
 
         log.info("GET_IMAGES", {
@@ -2186,6 +2223,7 @@
               img,
               mode,
               lang,
+              ocrEngine,
               "img_one",
               "context_menu_single",
               true,

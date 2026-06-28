@@ -90,6 +90,19 @@ function isCliSource(source) {
   return String(source || "").trim().toLowerCase().startsWith("cli_");
 }
 
+function normalizeOcrEngineForMode(mode, ocrEngine) {
+  const engine = String(ocrEngine || "").trim().toLowerCase().replace(/-/g, "_");
+  return mode === "lens_text" && engine === "paddleocr" ? "paddleocr" : "google_lens";
+}
+
+function normalizeSourceForOcr(mode, source, ocrEngine) {
+  const s = String(source || "").trim() || "translated";
+  if (mode === "lens_text" && ocrEngine === "paddleocr" && s === "translated") {
+    return "original";
+  }
+  return s;
+}
+
 function clampNumber(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -548,7 +561,7 @@ let settingsEpoch = 0;
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local" || !changes) return;
-  if (!changes.mode && !changes.lang && !changes.sources) return;
+  if (!changes.mode && !changes.lang && !changes.sources && !changes.ocrEngine) return;
   settingsEpoch = (settingsEpoch + 1) >>> 0;
 });
 
@@ -835,12 +848,13 @@ function mdScopeFromMode(mode) {
   return String(mode || "");
 }
 
-function mdCacheKey(mdKey, lang, mode) {
+function mdCacheKey(mdKey, lang, mode, ocrEngine = "google_lens") {
   const k = String(mdKey || "");
   const l = String(lang || "");
   const s = mdScopeFromMode(mode);
+  const e = String(ocrEngine || "google_lens").trim() || "google_lens";
   if (!k || !l || !s) return "";
-  return k + "::" + l + "::" + s;
+  return k + "::" + l + "::" + s + "::" + e;
 }
 
 function stripImageFields(res) {
@@ -906,6 +920,7 @@ async function idempotencyKeyForPayload(payload) {
     mode: payload?.mode || "",
     lang: payload?.lang || "",
     source: payload?.source || "",
+    ocrEngine: payload?.ocrEngine || "google_lens",
     aiProvider: ai.provider || "",
     aiModel: ai.model || "",
     aiBaseUrl: ai.base_url || "",
@@ -926,6 +941,7 @@ async function submitJobViaRest(base, payload) {
     mode: payload?.mode || "",
     lang: payload?.lang || "",
     source: payload?.source || "",
+    ocrEngine: payload?.ocrEngine || "",
     aiProvider: payload?.ai?.provider || "",
     aiKeyMarker: String(payload?.ai?.api_key || "").slice(0, 40),
     hasDataUri: Boolean(payload?.imageDataUri),
@@ -1665,7 +1681,7 @@ async function handleResult(jobId, result) {
 
   const mdKey = mdKeyFromUrl(imgUrl);
   const lang = ctx.lang || ctx.metadata?.lang || null;
-  const cacheKey = mdCacheKey(mdKey, lang, mode);
+  const cacheKey = mdCacheKey(mdKey, lang, mode, ctx.ocrEngine || ctx.metadata?.ocrEngine || "google_lens");
   if (cacheKey && (newImg || hasHtml)) {
     pruneMdCache();
     const prev = mdCacheByKey.get(cacheKey) || {};
@@ -1962,6 +1978,7 @@ async function processJob(payload, tabId, frameId = 0) {
       mode: payload?.mode || null,
       lang: payload?.lang || null,
       source: payload?.source || null,
+      ocrEngine: payload?.ocrEngine || "google_lens",
       metadata: payload.metadata,
       imageKey,
       batchId,
@@ -1982,6 +1999,7 @@ async function processJob(payload, tabId, frameId = 0) {
         mode: payload?.mode || null,
         lang: payload?.lang || null,
         source: payload?.source || null,
+        ocrEngine: payload?.ocrEngine || "google_lens",
         metadata: payload.metadata,
         startedAt: Date.now(),
         batchId,
@@ -2036,6 +2054,7 @@ async function processJob(payload, tabId, frameId = 0) {
               mode: payload?.mode || null,
               lang: payload?.lang || null,
               source: payload?.source || null,
+              ocrEngine: payload?.ocrEngine || "google_lens",
               metadata: payload.metadata,
               startedAt: Date.now(),
               batchId,
@@ -2090,6 +2109,7 @@ async function processJob(payload, tabId, frameId = 0) {
       mode: payload?.mode || null,
       lang: payload?.lang || null,
       source: payload?.source || null,
+      ocrEngine: payload?.ocrEngine || "google_lens",
       metadata: payload.metadata,
       startedAt: Date.now(),
       batchId,
@@ -2156,6 +2176,7 @@ async function getSettings() {
         "mode",
         "lang",
         "sources",
+        "ocrEngine",
         "maxConcurrency",
         "aiKey",
         "aiModel",
@@ -2209,6 +2230,7 @@ async function getSettings() {
           mode: typeof it.mode === "string" ? it.mode : "lens_images",
           lang,
           sources: typeof it.sources === "string" ? it.sources : "translated",
+          ocrEngine: typeof it.ocrEngine === "string" ? it.ocrEngine : "google_lens",
           aiKey: typeof it.aiKey === "string" ? it.aiKey : "",
           aiModel,
           aiProvider: typeof it.aiProvider === "string" ? it.aiProvider : "auto",
@@ -2229,10 +2251,13 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
     const tabSessionId = tab?.id
       ? ensureTabSession(tab.id, tab?.url || "")
       : "";
-    const { mode, lang, sources, aiKey, aiModel, aiProvider, aiBaseUrl, aiPrompt, cliTool, codexEffort } =
+    const { mode, lang, sources, ocrEngine, aiKey, aiModel, aiProvider, aiBaseUrl, aiPrompt, cliTool, codexEffort } =
       await getSettings();
+    const effectiveOcrEngine = normalizeOcrEngineForMode(mode, ocrEngine);
     let source =
-      mode === "lens_text" ? sources || "translated" : "translated";
+      mode === "lens_text"
+        ? normalizeSourceForOcr(mode, sources || "translated", effectiveOcrEngine)
+        : "translated";
     let aiPayload = null;
     if (mode === "lens_text") {
       if (source === "ai") {
@@ -2261,6 +2286,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
       lang,
       storedSource: sources || "",
       effectiveSource: source,
+      ocrEngine: effectiveOcrEngine,
       cliTool: cliTool || "",
       hasAiPayload: Boolean(aiPayload),
       aiProvider: aiPayload?.provider || "",
@@ -2350,6 +2376,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
         ...(payload && typeof payload === "object" ? payload : {}),
         mode,
         lang,
+        ocrEngine: effectiveOcrEngine,
         type: "image",
         src: sourceUrl,
         imageDataUri:
@@ -2372,6 +2399,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
           image_id: imageId,
           batch_id: currentBatchId,
           original_image_url: sourceUrl,
+          ocrEngine: effectiveOcrEngine,
           position: metadata0.position || null,
           ocr_image: null,
           extra: null,
@@ -2452,6 +2480,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
           return {
             mode,
             lang,
+            ocrEngine: effectiveOcrEngine,
             type: "image",
             src: src || null,
             imageDataUri:
@@ -2472,6 +2501,7 @@ chrome.contextMenus.onClicked.addListener(async (menuInfo, tab) => {
               image_id: imageId,
               batch_id: currentBatchId,
               original_image_url: src || null,
+              ocrEngine: effectiveOcrEngine,
               position: m.position || null,
               ocr_image: null,
               extra: null,
@@ -2637,7 +2667,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     for (const k of keys) {
       const mdKey = String(k || "");
       if (!mdKey) continue;
-      const cacheKey = mdCacheKey(mdKey, lang, mode);
+      const cacheKey = mdCacheKey(mdKey, lang, mode, msg?.ocrEngine || "google_lens");
       if (!cacheKey) continue;
       const rec = mdCacheByKey.get(cacheKey);
       if (!rec) continue;

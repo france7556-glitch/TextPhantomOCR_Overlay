@@ -128,6 +128,32 @@ const FALLBACK_SOURCES = [
   { id: "cli", name: "CLI Tools" },
 ];
 
+const OCR_ENGINES = [
+  { id: "google_lens", name: "Google Lens" },
+  { id: "paddleocr", name: "PaddleOCR Local" },
+];
+
+function normalizeOcrEngineForMode(mode, ocrEngine) {
+  const engine = String(ocrEngine || "").trim().toLowerCase().replace(/-/g, "_");
+  return mode === "lens_text" && engine === "paddleocr" ? "paddleocr" : "google_lens";
+}
+
+function sourceOptionsForOcr(sources, mode, ocrEngine) {
+  const list = Array.isArray(sources) && sources.length ? sources : FALLBACK_SOURCES;
+  const engine = normalizeOcrEngineForMode(mode, ocrEngine);
+  if (mode === "lens_text" && engine === "paddleocr") {
+    return list.filter((s) => String(s?.id || "") !== "translated");
+  }
+  return list;
+}
+
+function normalizeSourceForOcr(mode, source, ocrEngine) {
+  const s = String(source || "").trim() || "translated";
+  return mode === "lens_text" && normalizeOcrEngineForMode(mode, ocrEngine) === "paddleocr" && s === "translated"
+    ? "original"
+    : s;
+}
+
 const HEALTH_PATH = "/health";
 const META_PATH = "/meta";
 const AI_RESOLVE_PATH = "/ai/resolve";
@@ -176,6 +202,8 @@ const langSel = document.getElementById("lang");
 const sourcesSel = document.getElementById("sources");
 const langWrap = document.getElementById("lang-wrap");
 const sourcesWrap = document.getElementById("sources-wrap");
+const ocrEngineWrap = document.getElementById("ocr-engine-wrap");
+const ocrEngineSel = document.getElementById("ocr-engine");
 const cliToolWrap = document.getElementById("cli-tool-wrap");
 const cliToolSel = document.getElementById("cli-tool");
 const aiKeyWrap = document.getElementById("ai-key-wrap");
@@ -224,6 +252,7 @@ let lastResolvedKey = "";
 
 let desiredLang = "en";
 let desiredSources = "translated";
+let desiredOcrEngine = "google_lens";
 let desiredCliTool = "cli_gemini";
 let desiredAiModel = "auto";
 let desiredAiProvider = "auto";
@@ -562,8 +591,16 @@ function toggleUi() {
   const modeId = modeSel.value || "lens_text";
   const isText = modeId === "lens_text";
   sourcesWrap.style.display = isText ? "" : "none";
+  if (ocrEngineWrap) ocrEngineWrap.style.display = isText ? "" : "none";
 
-  const source = (sourcesSel.value || "").trim() || "translated";
+  let source = (sourcesSel.value || "").trim() || "translated";
+  const ocrEngine = (ocrEngineSel?.value || desiredOcrEngine || "google_lens").trim();
+  if (isText && ocrEngine === "paddleocr" && source === "translated") {
+    sourcesSel.value = "original";
+    desiredSources = "original";
+    source = "original";
+    chrome.storage.local.set({ sources: desiredSources });
+  }
   const needLang = MODES.find((m) => m.id === modeId)?.needLang ?? true;
   const showLang = needLang && !(isText && source === "original");
   langWrap.style.display = showLang ? "" : "none";
@@ -607,15 +644,17 @@ async function refreshMeta(baseUrl) {
           : FALLBACK_SOURCES;
       const beforeLang = langSel.value;
       const beforeSources = sourcesSel.value;
+      const modeId = modeSel.value || "lens_text";
+      const engineId = ocrEngineSel?.value || desiredOcrEngine || "google_lens";
       setSelectOptions(langSel, langs, {
         valueKey: "code",
         labelKey: "name",
         keepValue: desiredLang || beforeLang,
       });
-      setSelectOptions(sourcesSel, sources, {
+      setSelectOptions(sourcesSel, sourceOptionsForOcr(sources, modeId, engineId), {
         valueKey: "id",
         labelKey: "name",
-        keepValue: desiredSources || beforeSources,
+        keepValue: normalizeSourceForOcr(modeId, desiredSources || beforeSources, engineId),
       });
 
       const afterLang = langSel.value;
@@ -1121,6 +1160,7 @@ async function loadSettings() {
     "mode",
     "lang",
     "sources",
+    "ocrEngine",
     "customApiUrl",
     "aiKey",
     "aiModel",
@@ -1138,6 +1178,10 @@ async function loadSettings() {
     typeof stored.sources === "string" && stored.sources
       ? stored.sources
       : "translated";
+  desiredOcrEngine =
+    typeof stored.ocrEngine === "string" && stored.ocrEngine
+      ? stored.ocrEngine
+      : "google_lens";
   desiredAiModel =
     typeof stored.aiModel === "string" && stored.aiModel
       ? stored.aiModel
@@ -1154,14 +1198,22 @@ async function loadSettings() {
     labelKey: "name",
     keepValue: desiredLang,
   });
-  setSelectOptions(sourcesSel, FALLBACK_SOURCES, {
+  setSelectOptions(sourcesSel, sourceOptionsForOcr(FALLBACK_SOURCES, modeSel.value || "lens_text", desiredOcrEngine), {
     valueKey: "id",
     labelKey: "name",
-    keepValue: desiredSources,
+    keepValue: normalizeSourceForOcr(modeSel.value || "lens_text", desiredSources, desiredOcrEngine),
   });
+  if (ocrEngineSel) {
+    setSelectOptions(ocrEngineSel, OCR_ENGINES, {
+      valueKey: "id",
+      labelKey: "name",
+      keepValue: desiredOcrEngine,
+    });
+  }
 
   langSel.value = desiredLang;
-  sourcesSel.value = desiredSources;
+  sourcesSel.value = normalizeSourceForOcr(modeSel.value || "lens_text", desiredSources, desiredOcrEngine);
+  if (ocrEngineSel) ocrEngineSel.value = desiredOcrEngine;
   cliToolSel.value = desiredCliTool;
   if (aiProviderSel) aiProviderSel.value = desiredAiProvider;
   if (codexEffortSel) codexEffortSel.value = desiredCodexEffort;
@@ -1331,6 +1383,22 @@ cliToolSel.addEventListener("change", async () => {
   await chrome.storage.local.set({ cliTool: desiredCliTool });
   toggleUi();
   refreshAiMeta({ forcePrompt: false });
+  chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
+});
+
+ocrEngineSel?.addEventListener("change", async () => {
+  desiredOcrEngine = ocrEngineSel.value || "google_lens";
+  const modeId = modeSel.value || "lens_text";
+  const nextSource = normalizeSourceForOcr(modeId, sourcesSel.value || desiredSources, desiredOcrEngine);
+  setSelectOptions(sourcesSel, sourceOptionsForOcr(metaCache?.sources || FALLBACK_SOURCES, modeId, desiredOcrEngine), {
+    valueKey: "id",
+    labelKey: "name",
+    keepValue: nextSource,
+  });
+  desiredSources = sourcesSel.value || nextSource;
+  await chrome.storage.local.set({ ocrEngine: desiredOcrEngine });
+  if (desiredSources) await chrome.storage.local.set({ sources: desiredSources });
+  toggleUi();
   chrome.runtime.sendMessage({ type: "AI_SETTINGS_CHANGED" });
 });
 

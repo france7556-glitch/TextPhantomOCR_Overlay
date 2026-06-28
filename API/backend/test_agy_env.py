@@ -1,62 +1,72 @@
 import os
+import shutil
 import subprocess
+import unittest
 
-def run_agy(mode: str):
+
+def _find_agy() -> str:
+    exe = shutil.which("agy")
+    if exe:
+        return exe
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    candidates = []
+    if local_app_data:
+        candidates.append(os.path.join(local_app_data, "agy", "bin", "agy.exe"))
+    candidates.append(
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "agy", "bin", "agy.exe")
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def _env_for_mode(mode: str) -> dict:
     env = os.environ.copy()
-    if mode == "clean":
-        for k in list(env.keys()):
-            if k.startswith("ANTIGRAVITY_") or k.startswith("GEMINI_") or k.startswith("CODEX_"):
-                del env[k]
-    elif mode == "fixed":
-        for k in list(env.keys()):
-            if k.startswith("ANTIGRAVITY_") or k.startswith("GEMINI_") or k.startswith("CODEX_"):
-                del env[k]
+    if mode in ("clean", "fixed"):
+        for key in list(env.keys()):
+            if key.startswith(("ANTIGRAVITY_", "GEMINI_", "CODEX_")):
+                del env[key]
+    if mode == "fixed":
         gemini_dir = os.path.abspath(os.path.join(os.path.expanduser("~"), ".gemini"))
         env["GEMINI_DIR"] = gemini_dir
         env["GEMINI_HOME"] = gemini_dir
-    
-    # Locate agy.exe
-    import shutil
-    exe = shutil.which("agy")
-    if not exe:
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        if local_app_data:
-            candidate = os.path.join(local_app_data, "agy", "bin", "agy.exe")
-            if os.path.exists(candidate):
-                exe = candidate
-    if not exe:
-        home = os.path.expanduser("~")
-        candidate = os.path.join(home, "AppData", "Local", "agy", "bin", "agy.exe")
-        if os.path.exists(candidate):
-            exe = candidate
-    if not exe:
-        exe = "agy"
-        
-    cmd = [exe, "--print", "Translate hello to Thai.", "--dangerously-skip-permissions"]
-    print(f"Running with mode={mode} using {exe}...")
-    try:
-        proc = subprocess.Popen(
-            cmd,
+    env["NO_COLOR"] = "1"
+    return env
+
+
+class AgyEnvTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.exe = _find_agy()
+        if not cls.exe:
+            raise unittest.SkipTest("agy executable not found")
+
+    def _run_agy(self, mode: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [self.exe, "--print", "Translate hello to Thai.", "--dangerously-skip-permissions"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env
+            env=_env_for_mode(mode),
+            timeout=20,
         )
-        stdout, stderr = proc.communicate(timeout=15)
-        print(f"Return code: {proc.returncode}")
-        print(f"Stdout len: {len(stdout)}")
-        print(f"Stderr len: {len(stderr)}")
-        print(f"Stdout: {stdout.strip()!r}")
-        print(f"Stderr: {stderr.strip()!r}")
-    except Exception as e:
-        print(f"Failed: {e}")
 
-print("--- Test 1: Inherited Env ---")
-run_agy("inherited")
-print("\n--- Test 2: Clean Env ---")
-run_agy("clean")
-print("\n--- Test 3: Fixed Env (GEMINI_DIR absolute) ---")
-run_agy("fixed")
+    def test_inherited_env_exits_cleanly(self):
+        proc = self._run_agy("inherited")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_clean_env_exits_cleanly(self):
+        proc = self._run_agy("clean")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_fixed_env_exits_cleanly(self):
+        proc = self._run_agy("fixed")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

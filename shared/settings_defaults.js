@@ -1,6 +1,7 @@
 export const DEFAULT_MODE = "lens_text";
 export const DEFAULT_LANG = "en";
 export const DEFAULT_SOURCE = "translated";
+export const DEFAULT_OCR_ENGINE = "google_lens";
 
 export function normalizeMode(value) {
   const v = String(value || "").trim();
@@ -14,4 +15,11 @@ export function normalizeLang(value) {
 export function normalizeSource(value) {
   const v = String(value || "").trim().toLowerCase();
   return v || DEFAULT_SOURCE;
+}
+
+export function normalizeOcrEngine(value) {
+  const v = String(value || "").trim().toLowerCase().replace(/-/g, "_");
+  return v === "paddle" || v === "paddle_ocr" || v === "paddleocr"
+    ? "paddleocr"
+    : DEFAULT_OCR_ENGINE;
 }
